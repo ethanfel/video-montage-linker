@@ -19,7 +19,7 @@ from .models import (
     DatabaseError,
 )
 from .database import DatabaseManager
-from .blender import ImageBlender, TransitionGenerator, RifeDownloader, PracticalRifeEnv
+from .blender import ImageBlender, TransitionGenerator, RifeDownloader, PracticalRifeEnv, OPTICAL_FLOW_PRESETS
 from .manager import SymlinkManager
 
 __all__ = [
@@ -45,4 +45,5 @@ __all__ = [
     'RifeDownloader',
     'PracticalRifeEnv',
     'SymlinkManager',
+    'OPTICAL_FLOW_PRESETS',
 ]

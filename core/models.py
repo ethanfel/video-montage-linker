@@ -51,6 +51,13 @@ class TransitionSettings:
     # Practical-RIFE settings
     practical_rife_model: str = 'v4.25'  # v4.25, v4.26, v4.22, etc.
     practical_rife_ensemble: bool = False  # Ensemble mode for better quality (slower)
+    # Optical flow settings
+    of_preset: str = 'balanced'  # fast, balanced, quality, max
+    of_levels: int = 3           # pyramid levels (1-7)
+    of_winsize: int = 15         # window size (5-51, odd)
+    of_iterations: int = 3       # iterations (1-10)
+    of_poly_n: int = 5           # polynomial neighborhood (5 or 7)
+    of_poly_sigma: float = 1.2   # gaussian sigma (0.5-2.0)
 
 
 @dataclass

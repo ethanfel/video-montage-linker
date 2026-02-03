@@ -31,6 +31,14 @@ CACHE_DIR = Path.home() / '.cache' / 'video-montage-linker'
 RIFE_GITHUB_API = 'https://api.github.com/repos/nihui/rife-ncnn-vulkan/releases/latest'
 PRACTICAL_RIFE_VENV_DIR = CACHE_DIR / 'venv-rife'
 
+# Optical flow presets
+OPTICAL_FLOW_PRESETS = {
+    'fast': {'levels': 2, 'winsize': 11, 'iterations': 2, 'poly_n': 5, 'poly_sigma': 1.1},
+    'balanced': {'levels': 3, 'winsize': 15, 'iterations': 3, 'poly_n': 5, 'poly_sigma': 1.2},
+    'quality': {'levels': 5, 'winsize': 21, 'iterations': 5, 'poly_n': 7, 'poly_sigma': 1.5},
+    'max': {'levels': 7, 'winsize': 31, 'iterations': 10, 'poly_n': 7, 'poly_sigma': 1.5},
+}
+
 
 class PracticalRifeEnv:
     """Manages isolated Python environment for Practical-RIFE."""
@@ -541,7 +549,16 @@ class ImageBlender:
         return Image.blend(frames[lower_idx], frames[upper_idx], frac)
 
     @staticmethod
-    def optical_flow_blend(img_a: Image.Image, img_b: Image.Image, t: float) -> Image.Image:
+    def optical_flow_blend(
+        img_a: Image.Image,
+        img_b: Image.Image,
+        t: float,
+        levels: int = 3,
+        winsize: int = 15,
+        iterations: int = 3,
+        poly_n: int = 5,
+        poly_sigma: float = 1.2
+    ) -> Image.Image:
         """Blend using OpenCV optical flow for motion compensation.
 
         Uses Farneback dense optical flow to warp frames and reduce ghosting
@@ -551,6 +568,11 @@ class ImageBlender:
             img_a: First PIL Image (source frame).
             img_b: Second PIL Image (target frame).
             t: Interpolation factor 0.0 (100% A) to 1.0 (100% B).
+            levels: Pyramid levels for optical flow (1-7).
+            winsize: Window size for optical flow (5-51, odd).
+            iterations: Number of iterations (1-10).
+            poly_n: Polynomial neighborhood size (5 or 7).
+            poly_sigma: Gaussian sigma for polynomial expansion (0.5-2.0).
 
         Returns:
             Motion-compensated blended PIL Image.
@@ -571,11 +593,11 @@ class ImageBlender:
         flow = cv2.calcOpticalFlowFarneback(
             gray_a, gray_b, None,
             pyr_scale=0.5,
-            levels=3,
-            winsize=15,
-            iterations=3,
-            poly_n=5,
-            poly_sigma=1.2,
+            levels=levels,
+            winsize=winsize,
+            iterations=iterations,
+            poly_n=poly_n,
+            poly_sigma=poly_sigma,
             flags=0
         )
 
@@ -817,7 +839,12 @@ class ImageBlender:
         rife_uhd: bool = False,
         rife_tta: bool = False,
         practical_rife_model: str = 'v4.25',
-        practical_rife_ensemble: bool = False
+        practical_rife_ensemble: bool = False,
+        of_levels: int = 3,
+        of_winsize: int = 15,
+        of_iterations: int = 3,
+        of_poly_n: int = 5,
+        of_poly_sigma: float = 1.2
     ) -> BlendResult:
         """Blend two images together.
 
@@ -836,6 +863,11 @@ class ImageBlender:
             rife_tta: Enable RIFE ncnn TTA mode.
             practical_rife_model: Practical-RIFE model version (e.g., 'v4.25').
             practical_rife_ensemble: Enable Practical-RIFE ensemble mode.
+            of_levels: Optical flow pyramid levels (1-7).
+            of_winsize: Optical flow window size (5-51, odd).
+            of_iterations: Optical flow iterations (1-10).
+            of_poly_n: Optical flow polynomial neighborhood (5 or 7).
+            of_poly_sigma: Optical flow gaussian sigma (0.5-2.0).
 
         Returns:
             BlendResult with operation status.
@@ -856,7 +888,14 @@ class ImageBlender:
 
             # Blend images using selected method
             if blend_method == BlendMethod.OPTICAL_FLOW:
-                blended = ImageBlender.optical_flow_blend(img_a, img_b, factor)
+                blended = ImageBlender.optical_flow_blend(
+                    img_a, img_b, factor,
+                    levels=of_levels,
+                    winsize=of_winsize,
+                    iterations=of_iterations,
+                    poly_n=of_poly_n,
+                    poly_sigma=of_poly_sigma
+                )
             elif blend_method == BlendMethod.RIFE:
                 blended = ImageBlender.rife_blend(
                     img_a, img_b, factor, rife_binary_path, True, rife_model, rife_uhd, rife_tta
@@ -922,7 +961,12 @@ class ImageBlender:
         rife_uhd: bool = False,
         rife_tta: bool = False,
         practical_rife_model: str = 'v4.25',
-        practical_rife_ensemble: bool = False
+        practical_rife_ensemble: bool = False,
+        of_levels: int = 3,
+        of_winsize: int = 15,
+        of_iterations: int = 3,
+        of_poly_n: int = 5,
+        of_poly_sigma: float = 1.2
     ) -> BlendResult:
         """Blend two PIL Image objects together.
 
@@ -941,6 +985,11 @@ class ImageBlender:
             rife_tta: Enable RIFE ncnn TTA mode.
             practical_rife_model: Practical-RIFE model version (e.g., 'v4.25').
             practical_rife_ensemble: Enable Practical-RIFE ensemble mode.
+            of_levels: Optical flow pyramid levels (1-7).
+            of_winsize: Optical flow window size (5-51, odd).
+            of_iterations: Optical flow iterations (1-10).
+            of_poly_n: Optical flow polynomial neighborhood (5 or 7).
+            of_poly_sigma: Optical flow gaussian sigma (0.5-2.0).
 
         Returns:
             BlendResult with operation status.
@@ -958,7 +1007,14 @@ class ImageBlender:
 
             # Blend images using selected method
             if blend_method == BlendMethod.OPTICAL_FLOW:
-                blended = ImageBlender.optical_flow_blend(img_a, img_b, factor)
+                blended = ImageBlender.optical_flow_blend(
+                    img_a, img_b, factor,
+                    levels=of_levels,
+                    winsize=of_winsize,
+                    iterations=of_iterations,
+                    poly_n=of_poly_n,
+                    poly_sigma=of_poly_sigma
+                )
             elif blend_method == BlendMethod.RIFE:
                 blended = ImageBlender.rife_blend(
                     img_a, img_b, factor, rife_binary_path, True, rife_model, rife_uhd, rife_tta
@@ -1215,7 +1271,12 @@ class TransitionGenerator:
                 self.settings.rife_uhd,
                 self.settings.rife_tta,
                 self.settings.practical_rife_model,
-                self.settings.practical_rife_ensemble
+                self.settings.practical_rife_ensemble,
+                self.settings.of_levels,
+                self.settings.of_winsize,
+                self.settings.of_iterations,
+                self.settings.of_poly_n,
+                self.settings.of_poly_sigma
             )
             results.append(result)
 

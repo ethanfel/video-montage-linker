@@ -1,5 +1,6 @@
 """Main window UI for Video Montage Linker."""
 
+import json
 import os
 import re
 from pathlib import Path
@@ -39,6 +40,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QCheckBox,
+    QDoubleSpinBox,
 )
 from PyQt6.QtGui import QPixmap
 
@@ -56,6 +58,7 @@ from core import (
     RifeDownloader,
     PracticalRifeEnv,
     SymlinkManager,
+    OPTICAL_FLOW_PRESETS,
 )
 from .widgets import TrimSlider
 
@@ -249,14 +252,25 @@ class SequenceLinkerUI(QWidget):
         self.move_down_btn = QPushButton("▼")
         self.move_down_btn.setFixedWidth(40)
 
-        # Destination - now with two paths
+        # Destination - now with two paths (editable combo boxes with history)
         self.dst_label = QLabel("Destination Folder:")
-        self.dst_path = QLineEdit(placeholderText="Select destination folder for symlinks")
+        self.dst_path = QComboBox()
+        self.dst_path.setEditable(True)
+        self.dst_path.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.dst_path.lineEdit().setPlaceholderText("Select destination folder for symlinks")
+        self.dst_path.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.dst_btn = QPushButton("Browse")
 
         self.trans_dst_label = QLabel("Transition Destination:")
-        self.trans_dst_path = QLineEdit(placeholderText="Select destination for transition output (optional)")
+        self.trans_dst_path = QComboBox()
+        self.trans_dst_path.setEditable(True)
+        self.trans_dst_path.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.trans_dst_path.lineEdit().setPlaceholderText("Select destination for transition output (optional)")
+        self.trans_dst_path.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.trans_dst_btn = QPushButton("Browse")
+
+        # Load path history
+        self._load_path_history()
 
         # File list (Sequence Order tab)
         self.file_list = QTreeWidget()
@@ -471,6 +485,68 @@ class SequenceLinkerUI(QWidget):
         self.practical_status_label.setStyleSheet("color: gray; font-size: 10px;")
         self.practical_status_label.setVisible(False)
 
+        # Optical flow settings
+        self.of_preset_label = QLabel("OF Preset:")
+        self.of_preset_combo = QComboBox()
+        self.of_preset_combo.addItem("Fast", "fast")
+        self.of_preset_combo.addItem("Balanced", "balanced")
+        self.of_preset_combo.addItem("Quality", "quality")
+        self.of_preset_combo.addItem("Max", "max")
+        self.of_preset_combo.addItem("Custom", "custom")
+        self.of_preset_combo.setCurrentIndex(1)  # Default to Balanced
+        self.of_preset_combo.setToolTip(
+            "Optical flow quality preset:\n"
+            "- Fast: Quick processing, lower quality\n"
+            "- Balanced: Good balance of speed and quality\n"
+            "- Quality: Higher quality, slower\n"
+            "- Max: Best quality, slowest"
+        )
+        self.of_preset_label.setVisible(False)
+        self.of_preset_combo.setVisible(False)
+
+        self.of_levels_label = QLabel("Levels:")
+        self.of_levels_spin = QSpinBox()
+        self.of_levels_spin.setRange(1, 7)
+        self.of_levels_spin.setValue(3)
+        self.of_levels_spin.setToolTip("Pyramid levels (1-7): Higher = handles larger motion")
+        self.of_levels_label.setVisible(False)
+        self.of_levels_spin.setVisible(False)
+
+        self.of_winsize_label = QLabel("WinSize:")
+        self.of_winsize_spin = QSpinBox()
+        self.of_winsize_spin.setRange(5, 51)
+        self.of_winsize_spin.setSingleStep(2)
+        self.of_winsize_spin.setValue(15)
+        self.of_winsize_spin.setToolTip("Window size (5-51, odd): Larger = smoother but slower")
+        self.of_winsize_label.setVisible(False)
+        self.of_winsize_spin.setVisible(False)
+
+        self.of_iterations_label = QLabel("Iters:")
+        self.of_iterations_spin = QSpinBox()
+        self.of_iterations_spin.setRange(1, 10)
+        self.of_iterations_spin.setValue(3)
+        self.of_iterations_spin.setToolTip("Iterations (1-10): More = better convergence")
+        self.of_iterations_label.setVisible(False)
+        self.of_iterations_spin.setVisible(False)
+
+        self.of_poly_n_label = QLabel("PolyN:")
+        self.of_poly_n_combo = QComboBox()
+        self.of_poly_n_combo.addItem("5", 5)
+        self.of_poly_n_combo.addItem("7", 7)
+        self.of_poly_n_combo.setToolTip("Polynomial neighborhood (5 or 7): 7 = more robust")
+        self.of_poly_n_label.setVisible(False)
+        self.of_poly_n_combo.setVisible(False)
+
+        self.of_poly_sigma_label = QLabel("Sigma:")
+        self.of_poly_sigma_spin = QDoubleSpinBox()
+        self.of_poly_sigma_spin.setRange(0.5, 2.0)
+        self.of_poly_sigma_spin.setSingleStep(0.1)
+        self.of_poly_sigma_spin.setValue(1.2)
+        self.of_poly_sigma_spin.setDecimals(1)
+        self.of_poly_sigma_spin.setToolTip("Poly sigma (0.5-2.0): Gaussian smoothing")
+        self.of_poly_sigma_label.setVisible(False)
+        self.of_poly_sigma_spin.setVisible(False)
+
         # FPS setting for sequence playback and timeline
         self.fps_label = QLabel("FPS:")
         self.fps_spin = QSpinBox()
@@ -556,6 +632,18 @@ class SequenceLinkerUI(QWidget):
         transition_layout.addWidget(self.practical_ensemble_check)
         transition_layout.addWidget(self.practical_setup_btn)
         transition_layout.addWidget(self.practical_status_label)
+        transition_layout.addWidget(self.of_preset_label)
+        transition_layout.addWidget(self.of_preset_combo)
+        transition_layout.addWidget(self.of_levels_label)
+        transition_layout.addWidget(self.of_levels_spin)
+        transition_layout.addWidget(self.of_winsize_label)
+        transition_layout.addWidget(self.of_winsize_spin)
+        transition_layout.addWidget(self.of_iterations_label)
+        transition_layout.addWidget(self.of_iterations_spin)
+        transition_layout.addWidget(self.of_poly_n_label)
+        transition_layout.addWidget(self.of_poly_n_combo)
+        transition_layout.addWidget(self.of_poly_sigma_label)
+        transition_layout.addWidget(self.of_poly_sigma_spin)
         transition_layout.addWidget(self.fps_label)
         transition_layout.addWidget(self.fps_spin)
         transition_layout.addWidget(self.timeline_label)
@@ -673,7 +761,8 @@ class SequenceLinkerUI(QWidget):
         self.move_up_btn.clicked.connect(self._move_folder_up)
         self.move_down_btn.clicked.connect(self._move_folder_down)
         self.dst_btn.clicked.connect(self._browse_destination)
-        self.dst_path.editingFinished.connect(self._on_destination_changed)
+        self.dst_path.lineEdit().editingFinished.connect(self._on_destination_changed)
+        self.dst_path.currentIndexChanged.connect(self._on_destination_changed)
         self.trans_dst_btn.clicked.connect(self._browse_trans_destination)
         self.remove_files_btn.clicked.connect(self._remove_selected_files)
         self.refresh_btn.clicked.connect(self._refresh_files)
@@ -732,6 +821,14 @@ class SequenceLinkerUI(QWidget):
         self.practical_ensemble_check.stateChanged.connect(self._clear_blend_cache)
         self.practical_setup_btn.clicked.connect(self._setup_practical_rife)
 
+        # Optical flow signals
+        self.of_preset_combo.currentIndexChanged.connect(self._on_of_preset_changed)
+        self.of_levels_spin.valueChanged.connect(self._on_of_param_changed)
+        self.of_winsize_spin.valueChanged.connect(self._on_of_param_changed)
+        self.of_iterations_spin.valueChanged.connect(self._on_of_param_changed)
+        self.of_poly_n_combo.currentIndexChanged.connect(self._on_of_param_changed)
+        self.of_poly_sigma_spin.valueChanged.connect(self._on_of_param_changed)
+
         # Sequence table selection - show image
         self.sequence_table.currentItemChanged.connect(self._on_sequence_table_selected)
 
@@ -773,6 +870,7 @@ class SequenceLinkerUI(QWidget):
         method = self.blend_method_combo.currentData()
         is_rife_ncnn = (method == BlendMethod.RIFE)
         is_rife_practical = (method == BlendMethod.RIFE_PRACTICAL)
+        is_optical_flow = (method == BlendMethod.OPTICAL_FLOW)
 
         # RIFE ncnn settings
         self.rife_path_label.setVisible(is_rife_ncnn)
@@ -791,6 +889,20 @@ class SequenceLinkerUI(QWidget):
         self.practical_setup_btn.setVisible(is_rife_practical)
         self.practical_status_label.setVisible(is_rife_practical)
 
+        # Optical flow settings
+        self.of_preset_label.setVisible(is_optical_flow)
+        self.of_preset_combo.setVisible(is_optical_flow)
+        self.of_levels_label.setVisible(is_optical_flow)
+        self.of_levels_spin.setVisible(is_optical_flow)
+        self.of_winsize_label.setVisible(is_optical_flow)
+        self.of_winsize_spin.setVisible(is_optical_flow)
+        self.of_iterations_label.setVisible(is_optical_flow)
+        self.of_iterations_spin.setVisible(is_optical_flow)
+        self.of_poly_n_label.setVisible(is_optical_flow)
+        self.of_poly_n_combo.setVisible(is_optical_flow)
+        self.of_poly_sigma_label.setVisible(is_optical_flow)
+        self.of_poly_sigma_spin.setVisible(is_optical_flow)
+
         if is_rife_ncnn:
             self._update_rife_download_button()
 
@@ -803,6 +915,80 @@ class SequenceLinkerUI(QWidget):
     def _clear_blend_cache(self) -> None:
         """Clear the blend preview cache."""
         self._blend_preview_cache.clear()
+
+    def _on_of_preset_changed(self, index: int) -> None:
+        """Handle optical flow preset change."""
+        preset = self.of_preset_combo.currentData()
+        if preset == 'custom':
+            # User selected custom - don't change sliders
+            self._clear_blend_cache()
+            return
+
+        # Apply preset values to sliders
+        if preset in OPTICAL_FLOW_PRESETS:
+            values = OPTICAL_FLOW_PRESETS[preset]
+            # Block signals while updating to avoid triggering _on_of_param_changed
+            self.of_levels_spin.blockSignals(True)
+            self.of_winsize_spin.blockSignals(True)
+            self.of_iterations_spin.blockSignals(True)
+            self.of_poly_n_combo.blockSignals(True)
+            self.of_poly_sigma_spin.blockSignals(True)
+
+            self.of_levels_spin.setValue(values['levels'])
+            self.of_winsize_spin.setValue(values['winsize'])
+            self.of_iterations_spin.setValue(values['iterations'])
+            # Set poly_n combo
+            poly_n_idx = 0 if values['poly_n'] == 5 else 1
+            self.of_poly_n_combo.setCurrentIndex(poly_n_idx)
+            self.of_poly_sigma_spin.setValue(values['poly_sigma'])
+
+            self.of_levels_spin.blockSignals(False)
+            self.of_winsize_spin.blockSignals(False)
+            self.of_iterations_spin.blockSignals(False)
+            self.of_poly_n_combo.blockSignals(False)
+            self.of_poly_sigma_spin.blockSignals(False)
+
+        self._clear_blend_cache()
+
+    def _on_of_param_changed(self) -> None:
+        """Handle optical flow parameter change - set preset to Custom."""
+        # Check if current values match any preset
+        current_values = {
+            'levels': self.of_levels_spin.value(),
+            'winsize': self.of_winsize_spin.value(),
+            'iterations': self.of_iterations_spin.value(),
+            'poly_n': self.of_poly_n_combo.currentData(),
+            'poly_sigma': self.of_poly_sigma_spin.value(),
+        }
+
+        # Find matching preset
+        matching_preset = None
+        for preset_name, preset_values in OPTICAL_FLOW_PRESETS.items():
+            if (preset_values['levels'] == current_values['levels'] and
+                preset_values['winsize'] == current_values['winsize'] and
+                preset_values['iterations'] == current_values['iterations'] and
+                preset_values['poly_n'] == current_values['poly_n'] and
+                abs(preset_values['poly_sigma'] - current_values['poly_sigma']) < 0.05):
+                matching_preset = preset_name
+                break
+
+        # Update preset combo without triggering _on_of_preset_changed
+        self.of_preset_combo.blockSignals(True)
+        if matching_preset:
+            # Find index of matching preset
+            for i in range(self.of_preset_combo.count()):
+                if self.of_preset_combo.itemData(i) == matching_preset:
+                    self.of_preset_combo.setCurrentIndex(i)
+                    break
+        else:
+            # Set to Custom
+            for i in range(self.of_preset_combo.count()):
+                if self.of_preset_combo.itemData(i) == 'custom':
+                    self.of_preset_combo.setCurrentIndex(i)
+                    break
+        self.of_preset_combo.blockSignals(False)
+
+        self._clear_blend_cache()
 
     def _browse_rife_binary(self) -> None:
         """Browse for RIFE binary."""
@@ -1256,10 +1442,12 @@ class SequenceLinkerUI(QWidget):
                 blend_position, blend_count, settings.blend_curve
             )
 
-            # Create cache key (include RIFE settings when using RIFE)
+            # Create cache key (include method-specific settings)
             cache_key = f"{main_path}|{trans_path}|{factor:.6f}|{settings.blend_method.value}|{settings.blend_curve.value}"
             if settings.blend_method == BlendMethod.RIFE:
                 cache_key += f"|{settings.rife_model}|{settings.rife_uhd}|{settings.rife_tta}"
+            elif settings.blend_method == BlendMethod.OPTICAL_FLOW:
+                cache_key += f"|{settings.of_levels}|{settings.of_winsize}|{settings.of_iterations}|{settings.of_poly_n}|{settings.of_poly_sigma}"
 
             # Check cache first
             if cache_key in self._blend_preview_cache:
@@ -1281,7 +1469,14 @@ class SequenceLinkerUI(QWidget):
 
                 # Blend images using selected method
                 if settings.blend_method == BlendMethod.OPTICAL_FLOW:
-                    blended = ImageBlender.optical_flow_blend(img_a, img_b, factor)
+                    blended = ImageBlender.optical_flow_blend(
+                        img_a, img_b, factor,
+                        levels=settings.of_levels,
+                        winsize=settings.of_winsize,
+                        iterations=settings.of_iterations,
+                        poly_n=settings.of_poly_n,
+                        poly_sigma=settings.of_poly_sigma
+                    )
                 elif settings.blend_method == BlendMethod.RIFE:
                     blended = ImageBlender.rife_blend(
                         img_a, img_b, factor, settings.rife_binary_path,
@@ -1394,7 +1589,7 @@ class SequenceLinkerUI(QWidget):
             self, "Select Transition Destination Folder", start_dir
         )
         if path:
-            self.trans_dst_path.setText(path)
+            self._add_to_path_history(self.trans_dst_path, path)
             self.last_directory = str(Path(path).parent)
 
     def _add_source_folder(
@@ -1561,6 +1756,85 @@ class SequenceLinkerUI(QWidget):
         for row in rows:
             self.file_list.takeTopLevelItem(row)
 
+    def _get_path_history_file(self) -> Path:
+        """Get the path to the history JSON file."""
+        cache_dir = Path.home() / '.cache' / 'video-montage-linker'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / 'path_history.json'
+
+    def _load_path_history(self) -> None:
+        """Load path history from disk and populate combo boxes."""
+        history_file = self._get_path_history_file()
+        if not history_file.exists():
+            return
+
+        try:
+            with open(history_file, 'r') as f:
+                history = json.load(f)
+
+            # Populate destination combo
+            dst_history = history.get('destination', [])
+            for path in dst_history:
+                if Path(path).exists():
+                    self.dst_path.addItem(path)
+
+            # Populate transition destination combo
+            trans_history = history.get('transition', [])
+            for path in trans_history:
+                if Path(path).exists():
+                    self.trans_dst_path.addItem(path)
+
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    def _save_path_history(self) -> None:
+        """Save path history to disk."""
+        history_file = self._get_path_history_file()
+
+        # Collect paths from combo boxes
+        dst_paths = [self.dst_path.itemText(i) for i in range(self.dst_path.count())]
+        trans_paths = [self.trans_dst_path.itemText(i) for i in range(self.trans_dst_path.count())]
+
+        history = {
+            'destination': dst_paths,
+            'transition': trans_paths
+        }
+
+        try:
+            with open(history_file, 'w') as f:
+                json.dump(history, f, indent=2)
+        except IOError:
+            pass
+
+    def _add_to_path_history(self, combo: QComboBox, path: str, max_items: int = 10) -> None:
+        """Add a path to the combo box history if not already present."""
+        if not path:
+            return
+
+        # Normalize path
+        path = str(Path(path).resolve())
+
+        # Check if already in list
+        for i in range(combo.count()):
+            if combo.itemText(i) == path:
+                # Move to top if not already there
+                if i > 0:
+                    combo.removeItem(i)
+                    combo.insertItem(0, path)
+                    combo.setCurrentIndex(0)
+                return
+
+        # Add to top of list
+        combo.insertItem(0, path)
+        combo.setCurrentIndex(0)
+
+        # Trim to max items
+        while combo.count() > max_items:
+            combo.removeItem(combo.count() - 1)
+
+        # Save history
+        self._save_path_history()
+
     def _browse_destination(self) -> None:
         """Select destination folder via file dialog."""
         start_dir = self.last_directory or ""
@@ -1568,15 +1842,17 @@ class SequenceLinkerUI(QWidget):
             self, "Select Destination Folder", start_dir
         )
         if path:
-            self.dst_path.setText(path)
+            self._add_to_path_history(self.dst_path, path)
             self.last_directory = str(Path(path).parent)
             self._try_resume_session(path)
 
     def _on_destination_changed(self) -> None:
         """Handle destination path text field changes."""
-        path = self.dst_path.text().strip()
+        path = self.dst_path.currentText().strip()
         if path and Path(path).is_dir():
             resolved = str(Path(path).resolve())
+            # Add to history if it's a valid directory
+            self._add_to_path_history(self.dst_path, path)
             if resolved != self._last_resumed_dest:
                 self._try_resume_session(path)
 
@@ -1675,9 +1951,22 @@ class SequenceLinkerUI(QWidget):
             self.webp_method_spin.setValue(db_transition_settings.webp_method)
             self.blend_quality_spin.setValue(db_transition_settings.output_quality)
             if db_transition_settings.trans_destination:
-                self.trans_dst_path.setText(str(db_transition_settings.trans_destination))
+                self._add_to_path_history(self.trans_dst_path, str(db_transition_settings.trans_destination))
             if db_transition_settings.rife_binary_path:
                 self.rife_path_input.setText(str(db_transition_settings.rife_binary_path))
+            # Restore optical flow settings
+            for i in range(self.of_preset_combo.count()):
+                if self.of_preset_combo.itemData(i) == db_transition_settings.of_preset:
+                    self.of_preset_combo.setCurrentIndex(i)
+                    break
+            self.of_levels_spin.setValue(db_transition_settings.of_levels)
+            self.of_winsize_spin.setValue(db_transition_settings.of_winsize)
+            self.of_iterations_spin.setValue(db_transition_settings.of_iterations)
+            for i in range(self.of_poly_n_combo.count()):
+                if self.of_poly_n_combo.itemData(i) == db_transition_settings.of_poly_n:
+                    self.of_poly_n_combo.setCurrentIndex(i)
+                    break
+            self.of_poly_sigma_spin.setValue(db_transition_settings.of_poly_sigma)
             # Update visibility of RIFE path widgets
             self._on_blend_method_changed(self.blend_method_combo.currentIndex())
 
@@ -1884,7 +2173,7 @@ class SequenceLinkerUI(QWidget):
     def _get_transition_settings(self) -> TransitionSettings:
         """Get current transition settings from UI."""
         trans_dest = None
-        trans_path = self.trans_dst_path.text().strip()
+        trans_path = self.trans_dst_path.currentText().strip()
         if trans_path:
             trans_dest = Path(trans_path)
 
@@ -1906,7 +2195,13 @@ class SequenceLinkerUI(QWidget):
             rife_uhd=self.rife_uhd_check.isChecked(),
             rife_tta=self.rife_tta_check.isChecked(),
             practical_rife_model=self.practical_model_combo.currentData(),
-            practical_rife_ensemble=self.practical_ensemble_check.isChecked()
+            practical_rife_ensemble=self.practical_ensemble_check.isChecked(),
+            of_preset=self.of_preset_combo.currentData(),
+            of_levels=self.of_levels_spin.value(),
+            of_winsize=self.of_winsize_spin.value(),
+            of_iterations=self.of_iterations_spin.value(),
+            of_poly_n=self.of_poly_n_combo.currentData(),
+            of_poly_sigma=self.of_poly_sigma_spin.value()
         )
 
     def _refresh_files(self, select_position: str = 'first') -> None:
@@ -2338,7 +2633,7 @@ class SequenceLinkerUI(QWidget):
 
     def _export_sequence(self) -> None:
         """Export symlinks only (no transitions)."""
-        dst = self.dst_path.text()
+        dst = self.dst_path.currentText()
 
         if not self.source_folders:
             QMessageBox.warning(self, "Error", "Add at least one source folder!")
@@ -2388,7 +2683,7 @@ class SequenceLinkerUI(QWidget):
 
     def _export_with_transitions(self) -> None:
         """Export with cross-dissolve transitions."""
-        dst = self.dst_path.text()
+        dst = self.dst_path.currentText()
 
         if not self.source_folders:
             QMessageBox.warning(self, "Error", "Add at least one source folder!")

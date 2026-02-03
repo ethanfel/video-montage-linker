@@ -13,18 +13,20 @@ A PyQt6 application for creating sequenced symlinks from image folders with adva
 - Per-folder trim settings (exclude frames from start/end)
 
 ### Cross-Dissolve Transitions
-Smooth blending between folder boundaries with three blend methods:
+Smooth blending between folder boundaries with four blend methods:
 
 | Method | Description | Quality | Speed |
 |--------|-------------|---------|-------|
 | **Cross-Dissolve** | Simple alpha blend | Good | Fastest |
 | **Optical Flow** | Motion-compensated blend using OpenCV Farneback | Better | Medium |
-| **RIFE (AI)** | Neural network frame interpolation | Best | Fast (GPU) |
+| **RIFE (ncnn)** | Neural network interpolation via rife-ncnn-vulkan | Best | Fast (GPU) |
+| **RIFE (Practical)** | PyTorch-based Practical-RIFE (v4.25/v4.26) | Best | Medium (GPU) |
 
 - **Asymmetric overlap**: Set different frame counts for each side of a transition
 - **Blend curves**: Linear, Ease In, Ease Out, Ease In/Out
 - **Output formats**: PNG, JPEG (with quality), WebP (lossless with method setting)
 - **RIFE auto-download**: Automatically downloads rife-ncnn-vulkan binary
+- **Practical-RIFE models**: Auto-downloads from Google Drive on first use
 
 ### Preview
 - **Video Preview**: Play video files from source folders
@@ -54,11 +56,24 @@ Smooth blending between folder boundaries with three blend methods:
 pip install PyQt6 Pillow numpy opencv-python
 ```
 
-### RIFE (Optional)
-For AI-powered frame interpolation, the app can auto-download [rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan) or you can install it manually:
-- Select **RIFE (AI)** as the blend method
-- Click **Download** to fetch the latest release
+**Note:** Practical-RIFE creates its own isolated venv with PyTorch. The `gdown` package is installed automatically for downloading models from Google Drive.
+
+### RIFE ncnn (Optional)
+For AI-powered frame interpolation using Vulkan GPU acceleration:
+- Select **RIFE (ncnn)** as the blend method
+- Click **Download** to auto-fetch [rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan)
 - Or specify a custom binary path
+- Models: rife-v4.6, rife-v4.15-lite, etc.
+
+### Practical-RIFE (Optional)
+For PyTorch-based frame interpolation with latest models:
+- Select **RIFE (Practical)** as the blend method
+- Click **Setup PyTorch** to create an isolated venv with PyTorch (~2GB)
+- Models auto-download from Google Drive on first use
+- Available models: v4.26, v4.25, v4.22, v4.20, v4.18, v4.15
+- Optional ensemble mode for higher quality (slower)
+
+The venv is stored at `~/.cache/video-montage-linker/venv-rife/`
 
 ## Usage
 
@@ -98,7 +113,8 @@ video-montage-linker/
 ├── core/
 │   ├── models.py       # Enums, dataclasses
 │   ├── database.py     # SQLite session management
-│   ├── blender.py      # Image blending, RIFE downloader
+│   ├── blender.py      # Image blending, RIFE downloader, Practical-RIFE env
+│   ├── rife_worker.py  # Practical-RIFE inference (runs in isolated venv)
 │   └── manager.py      # Symlink operations
 └── ui/
     ├── widgets.py      # TrimSlider, custom widgets

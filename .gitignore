@@ -1,5 +1,61 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.env
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+venv/
 venv-rife/
+.venv/
+env/
+
+# Environment files
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Downloads and cache
+*.pkl
+*.pt
+*.pth
+*.onnx
+downloads/
+cache/
+.cache/
+
+# RIFE binaries and models
+rife-ncnn-vulkan*/
+*.zip
+
+# Output directories
+output/
+outputs/
+temp/
+tmp/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

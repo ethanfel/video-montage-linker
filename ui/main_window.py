@@ -1289,6 +1289,12 @@ class SequenceLinkerUI(QWidget):
                         uhd=settings.rife_uhd,
                         tta=settings.rife_tta
                     )
+                elif settings.blend_method == BlendMethod.RIFE_PRACTICAL:
+                    blended = ImageBlender.practical_rife_blend(
+                        img_a, img_b, factor,
+                        settings.practical_rife_model,
+                        settings.practical_rife_ensemble
+                    )
                 else:
                     blended = Image.blend(img_a, img_b, factor)
 
@@ -2554,7 +2560,9 @@ class SequenceLinkerUI(QWidget):
                         main_path, trans_path, factor,
                         output_path, settings.output_format,
                         settings.output_quality, settings.webp_method,
-                        settings.blend_method, settings.rife_binary_path
+                        settings.blend_method, settings.rife_binary_path,
+                        settings.rife_model, settings.rife_uhd, settings.rife_tta,
+                        settings.practical_rife_model, settings.practical_rife_ensemble
                     )
 
                     if result.success:

@@ -29,7 +29,7 @@ from .models import (
 # Cache directory for downloaded binaries
 CACHE_DIR = Path.home() / '.cache' / 'video-montage-linker'
 RIFE_GITHUB_API = 'https://api.github.com/repos/nihui/rife-ncnn-vulkan/releases/latest'
-PRACTICAL_RIFE_VENV_DIR = Path('./venv-rife')
+PRACTICAL_RIFE_VENV_DIR = CACHE_DIR / 'venv-rife'
 
 
 class PracticalRifeEnv:
@@ -147,13 +147,13 @@ class PracticalRifeEnv:
                 )
 
             if progress_callback:
-                progress_callback("Installing numpy...", 90)
+                progress_callback("Installing additional dependencies...", 90)
             if cancelled_check and cancelled_check():
                 return False
 
-            # numpy is usually a dependency of torch but ensure it's there
+            # Install numpy (usually a dependency of torch) and gdown (for Google Drive downloads)
             subprocess.run(
-                [str(python), '-m', 'pip', 'install', 'numpy'],
+                [str(python), '-m', 'pip', 'install', 'numpy', 'gdown'],
                 capture_output=True
             )
 
@@ -190,7 +190,7 @@ class PracticalRifeEnv:
         t: float,
         model: str = 'v4.25',
         ensemble: bool = False
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """Run RIFE interpolation via subprocess in venv.
 
         Args:
@@ -202,15 +202,15 @@ class PracticalRifeEnv:
             ensemble: Enable ensemble mode.
 
         Returns:
-            True if interpolation succeeded.
+            Tuple of (success, error_message).
         """
         python = cls.get_venv_python()
         if not python or not python.exists():
-            return False
+            return False, "venv python not found"
 
         script = cls.get_worker_script()
         if not script.exists():
-            return False
+            return False, f"worker script not found: {script}"
 
         cmd = [
             str(python), str(script),
@@ -232,11 +232,15 @@ class PracticalRifeEnv:
                 text=True,
                 timeout=120  # 2 minute timeout per frame
             )
-            return result.returncode == 0 and output_path.exists()
+            if result.returncode == 0 and output_path.exists():
+                return True, ""
+            else:
+                error = result.stderr.strip() if result.stderr else f"returncode={result.returncode}"
+                return False, error
         except subprocess.TimeoutExpired:
-            return False
-        except Exception:
-            return False
+            return False, "timeout (120s)"
+        except Exception as e:
+            return False, str(e)
 
 
 class RifeDownloader:
@@ -768,7 +772,7 @@ class ImageBlender:
             AI-interpolated blended PIL Image.
         """
         if not PracticalRifeEnv.is_setup():
-            # Fall back to ncnn RIFE or optical flow
+            print("[Practical-RIFE] Venv not set up, falling back to ncnn RIFE", file=sys.stderr)
             return ImageBlender.rife_blend(img_a, img_b, t)
 
         try:
@@ -783,15 +787,17 @@ class ImageBlender:
                 img_b.convert('RGB').save(input_b)
 
                 # Run Practical-RIFE via subprocess
-                success = PracticalRifeEnv.run_interpolation(
+                success, error_msg = PracticalRifeEnv.run_interpolation(
                     input_a, input_b, output_file, t, model, ensemble
                 )
 
                 if success and output_file.exists():
                     return Image.open(output_file).copy()
+                else:
+                    print(f"[Practical-RIFE] Interpolation failed: {error_msg}, falling back to ncnn RIFE", file=sys.stderr)
 
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Practical-RIFE] Exception: {e}, falling back to ncnn RIFE", file=sys.stderr)
 
         # Fall back to ncnn RIFE or optical flow
         return ImageBlender.rife_blend(img_a, img_b, t)

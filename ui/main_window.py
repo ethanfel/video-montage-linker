@@ -5,8 +5,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QUrl, QEvent, QPoint
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QColor
+from PyQt6.QtCore import Qt, QUrl, QEvent, QPoint, QTimer
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QColor, QPainter, QFont, QFontMetrics
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QCheckBox,
 )
 from PyQt6.QtGui import QPixmap
 
@@ -53,9 +54,82 @@ from core import (
     DatabaseManager,
     TransitionGenerator,
     RifeDownloader,
+    PracticalRifeEnv,
     SymlinkManager,
 )
 from .widgets import TrimSlider
+
+
+class TimelineTreeWidget(QTreeWidget):
+    """QTreeWidget with timeline markers drawn in the background."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.fps = 16
+        self._text_color = QColor(100, 100, 100)
+
+    def set_fps(self, fps: int) -> None:
+        """Update FPS for timeline display."""
+        self.fps = max(1, fps)
+        self.viewport().update()
+
+    def paintEvent(self, event) -> None:
+        """Draw timeline markers in background, then call parent paint."""
+        # Draw the timeline background on the viewport
+        painter = QPainter(self.viewport())
+
+        frame_count = self.topLevelItemCount()
+        if frame_count > 0 and self.fps > 0:
+            # Get row height from first visible item
+            first_item = self.topLevelItem(0)
+            if first_item:
+                # Get column positions
+                col0_width = self.columnWidth(0)
+                viewport_width = self.viewport().width()
+
+                # Font for time labels
+                font = QFont("Monospace", 9)
+                painter.setFont(font)
+                metrics = QFontMetrics(font)
+
+                # Draw for each row
+                for i in range(frame_count):
+                    item = self.topLevelItem(i)
+                    if not item:
+                        continue
+
+                    item_rect = self.visualItemRect(item)
+                    if item_rect.isNull() or item_rect.bottom() < 0 or item_rect.top() > self.viewport().height():
+                        continue  # Not visible
+
+                    y_center = item_rect.center().y()
+
+                    # Calculate time for this frame
+                    time_seconds = i / self.fps
+                    is_major = (i % self.fps == 0)  # Every second
+
+                    if is_major:
+                        # Format time
+                        minutes = int(time_seconds // 60)
+                        seconds = int(time_seconds % 60)
+                        if minutes > 0:
+                            time_str = f"{minutes}:{seconds:02d}"
+                        else:
+                            time_str = f"{seconds}s"
+
+                        text_width = metrics.horizontalAdvance(time_str)
+                        painter.setPen(self._text_color)
+
+                        # Draw time label on right of column 0
+                        painter.drawText(col0_width - text_width - 6, y_center + metrics.ascent() // 2, time_str)
+
+                        # Draw time label on right of column 1 (right edge)
+                        painter.drawText(viewport_width - text_width - 6, y_center + metrics.ascent() // 2, time_str)
+
+        painter.end()
+
+        # Call parent to draw the actual tree content
+        super().paintEvent(event)
 
 
 class OverlapDialog(QDialog):
@@ -141,6 +215,8 @@ class SequenceLinkerUI(QWidget):
         self._create_layout()
         self._connect_signals()
         self.setAcceptDrops(True)
+        # Initialize sequence table FPS
+        self.sequence_table.set_fps(self.fps_spin.value())
 
     def _setup_window(self) -> None:
         """Configure the main window properties."""
@@ -260,14 +336,15 @@ class SequenceLinkerUI(QWidget):
         self._current_pixmap: Optional[QPixmap] = None
         self._pan_start = None
         self._pan_scrollbar_start = None
+        self._blend_preview_cache: dict[str, QPixmap] = {}  # Cache for generated blend frames
 
         # Trim slider
         self.trim_slider = TrimSlider()
         self.trim_label = QLabel("Frames: All included")
         self.trim_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # Sequence table (2-column: Main Frame | Transition Frame)
-        self.sequence_table = QTreeWidget()
+        # Sequence table (2-column: Main Frame | Transition Frame) with timeline background
+        self.sequence_table = TimelineTreeWidget()
         self.sequence_table.setHeaderLabels(["Main Frame", "Transition Frame"])
         self.sequence_table.setColumnCount(2)
         self.sequence_table.setRootIsDecorated(False)
@@ -317,12 +394,14 @@ class SequenceLinkerUI(QWidget):
         self.blend_method_combo = QComboBox()
         self.blend_method_combo.addItem("Cross-Dissolve", BlendMethod.ALPHA)
         self.blend_method_combo.addItem("Optical Flow", BlendMethod.OPTICAL_FLOW)
-        self.blend_method_combo.addItem("RIFE (AI)", BlendMethod.RIFE)
+        self.blend_method_combo.addItem("RIFE (ncnn)", BlendMethod.RIFE)
+        self.blend_method_combo.addItem("RIFE (Practical)", BlendMethod.RIFE_PRACTICAL)
         self.blend_method_combo.setToolTip(
             "Blending method:\n"
             "- Cross-Dissolve: Simple alpha blend (fast, may ghost)\n"
             "- Optical Flow: Motion-compensated blend (slower, less ghosting)\n"
-            "- RIFE: AI frame interpolation (best quality, requires rife-ncnn-vulkan)"
+            "- RIFE (ncnn): AI frame interpolation (fast, Vulkan GPU, models up to v4.6)\n"
+            "- RIFE (Practical): AI frame interpolation (PyTorch, latest models v4.25/v4.26)"
         )
 
         # RIFE binary path
@@ -337,6 +416,77 @@ class SequenceLinkerUI(QWidget):
         self.rife_path_input.setVisible(False)
         self.rife_path_btn.setVisible(False)
         self.rife_download_btn.setVisible(False)
+
+        # RIFE model selection
+        self.rife_model_label = QLabel("Model:")
+        self.rife_model_combo = QComboBox()
+        self.rife_model_combo.addItem("v4.6 (Best)", "rife-v4.6")
+        self.rife_model_combo.addItem("v4", "rife-v4")
+        self.rife_model_combo.addItem("v3.1", "rife-v3.1")
+        self.rife_model_combo.addItem("v2.4", "rife-v2.4")
+        self.rife_model_combo.addItem("Anime", "rife-anime")
+        self.rife_model_combo.addItem("UHD", "rife-UHD")
+        self.rife_model_combo.addItem("HD", "rife-HD")
+        self.rife_model_combo.setToolTip("RIFE model version:\n- v4.6: Latest, best quality\n- Anime: Optimized for animation\n- UHD/HD: For high resolution content")
+        self.rife_model_label.setVisible(False)
+        self.rife_model_combo.setVisible(False)
+
+        # RIFE UHD mode
+        self.rife_uhd_check = QCheckBox("UHD")
+        self.rife_uhd_check.setToolTip("Enable UHD mode for high resolution images (4K+)")
+        self.rife_uhd_check.setVisible(False)
+
+        # RIFE TTA mode
+        self.rife_tta_check = QCheckBox("TTA")
+        self.rife_tta_check.setToolTip("Enable TTA (Test-Time Augmentation) for better quality (slower)")
+        self.rife_tta_check.setVisible(False)
+
+        # Practical-RIFE settings
+        self.practical_model_label = QLabel("Model:")
+        self.practical_model_combo = QComboBox()
+        self.practical_model_combo.addItem("v4.26 (Latest)", "v4.26")
+        self.practical_model_combo.addItem("v4.25 (Recommended)", "v4.25")
+        self.practical_model_combo.addItem("v4.22", "v4.22")
+        self.practical_model_combo.addItem("v4.20", "v4.20")
+        self.practical_model_combo.addItem("v4.18", "v4.18")
+        self.practical_model_combo.addItem("v4.15", "v4.15")
+        self.practical_model_combo.setCurrentIndex(1)  # Default to v4.25
+        self.practical_model_combo.setToolTip(
+            "Practical-RIFE model version:\n"
+            "- v4.26: Latest version\n"
+            "- v4.25: Recommended, good balance of quality and speed"
+        )
+        self.practical_model_label.setVisible(False)
+        self.practical_model_combo.setVisible(False)
+
+        self.practical_ensemble_check = QCheckBox("Ensemble")
+        self.practical_ensemble_check.setToolTip("Enable ensemble mode for better quality (slower)")
+        self.practical_ensemble_check.setVisible(False)
+
+        self.practical_setup_btn = QPushButton("Setup PyTorch")
+        self.practical_setup_btn.setToolTip("Create local venv and install PyTorch (~2GB download)")
+        self.practical_setup_btn.setVisible(False)
+
+        self.practical_status_label = QLabel("")
+        self.practical_status_label.setStyleSheet("color: gray; font-size: 10px;")
+        self.practical_status_label.setVisible(False)
+
+        # FPS setting for sequence playback and timeline
+        self.fps_label = QLabel("FPS:")
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(1, 120)
+        self.fps_spin.setValue(16)
+        self.fps_spin.setToolTip("Frames per second for sequence preview and timeline")
+
+        # Timeline duration label
+        self.timeline_label = QLabel("Duration: 00:00.000 (0 frames)")
+        self.timeline_label.setStyleSheet("font-family: monospace;")
+
+        # Sequence playback button and timer
+        self.seq_play_btn = QPushButton("▶ Play")
+        self.seq_play_btn.setToolTip("Play image sequence at configured FPS")
+        self.sequence_timer = QTimer(self)
+        self.sequence_playing = False
 
     def _create_layout(self) -> None:
         """Arrange widgets in layouts."""
@@ -397,6 +547,19 @@ class SequenceLinkerUI(QWidget):
         transition_layout.addWidget(self.rife_path_input)
         transition_layout.addWidget(self.rife_path_btn)
         transition_layout.addWidget(self.rife_download_btn)
+        transition_layout.addWidget(self.rife_model_label)
+        transition_layout.addWidget(self.rife_model_combo)
+        transition_layout.addWidget(self.rife_uhd_check)
+        transition_layout.addWidget(self.rife_tta_check)
+        transition_layout.addWidget(self.practical_model_label)
+        transition_layout.addWidget(self.practical_model_combo)
+        transition_layout.addWidget(self.practical_ensemble_check)
+        transition_layout.addWidget(self.practical_setup_btn)
+        transition_layout.addWidget(self.practical_status_label)
+        transition_layout.addWidget(self.fps_label)
+        transition_layout.addWidget(self.fps_spin)
+        transition_layout.addWidget(self.timeline_label)
+        transition_layout.addWidget(self.seq_play_btn)
         transition_layout.addStretch()
         self.transition_group.setLayout(transition_layout)
 
@@ -459,11 +622,13 @@ class SequenceLinkerUI(QWidget):
         sequence_order_layout.addWidget(self.file_list)
         self.sequence_tabs.addTab(sequence_order_tab, "Sequence Order")
 
-        # Tab 2: With Transitions (2-column view)
+        # Tab 2: With Transitions (2-column view with timeline rulers)
         trans_sequence_tab = QWidget()
         trans_sequence_layout = QVBoxLayout(trans_sequence_tab)
         trans_sequence_layout.setContentsMargins(0, 0, 0, 0)
+
         trans_sequence_layout.addWidget(self.sequence_table)
+
         self.sequence_tabs.addTab(trans_sequence_tab, "With Transitions")
 
         file_list_layout.addWidget(self.sequence_tabs)
@@ -555,8 +720,17 @@ class SequenceLinkerUI(QWidget):
 
         # Blend method combo change - show/hide RIFE path
         self.blend_method_combo.currentIndexChanged.connect(self._on_blend_method_changed)
+        self.curve_combo.currentIndexChanged.connect(self._clear_blend_cache)
+        self.rife_model_combo.currentIndexChanged.connect(self._clear_blend_cache)
+        self.rife_uhd_check.stateChanged.connect(self._clear_blend_cache)
+        self.rife_tta_check.stateChanged.connect(self._clear_blend_cache)
         self.rife_path_btn.clicked.connect(self._browse_rife_binary)
         self.rife_download_btn.clicked.connect(self._download_rife_binary)
+
+        # Practical-RIFE signals
+        self.practical_model_combo.currentIndexChanged.connect(self._clear_blend_cache)
+        self.practical_ensemble_check.stateChanged.connect(self._clear_blend_cache)
+        self.practical_setup_btn.clicked.connect(self._setup_practical_rife)
 
         # Sequence table selection - show image
         self.sequence_table.currentItemChanged.connect(self._on_sequence_table_selected)
@@ -566,6 +740,14 @@ class SequenceLinkerUI(QWidget):
 
         # Update sequence table when switching to "With Transitions" tab
         self.sequence_tabs.currentChanged.connect(self._on_sequence_tab_changed)
+
+        # FPS and sequence playback signals
+        self.fps_spin.valueChanged.connect(self._update_timeline_display)
+        self.seq_play_btn.clicked.connect(self._toggle_sequence_play)
+        self.sequence_timer.timeout.connect(self._advance_sequence_frame)
+
+        # Update sequence table FPS when spinner changes
+        self.fps_spin.valueChanged.connect(self.sequence_table.set_fps)
 
     def _on_format_changed(self, index: int) -> None:
         """Handle format combo change to show/hide quality/method widgets."""
@@ -589,14 +771,38 @@ class SequenceLinkerUI(QWidget):
     def _on_blend_method_changed(self, index: int) -> None:
         """Handle blend method combo change to show/hide RIFE path widgets."""
         method = self.blend_method_combo.currentData()
-        is_rife = (method == BlendMethod.RIFE)
-        self.rife_path_label.setVisible(is_rife)
-        self.rife_path_input.setVisible(is_rife)
-        self.rife_path_btn.setVisible(is_rife)
-        self.rife_download_btn.setVisible(is_rife)
+        is_rife_ncnn = (method == BlendMethod.RIFE)
+        is_rife_practical = (method == BlendMethod.RIFE_PRACTICAL)
 
-        if is_rife:
+        # RIFE ncnn settings
+        self.rife_path_label.setVisible(is_rife_ncnn)
+        self.rife_path_input.setVisible(is_rife_ncnn)
+        self.rife_path_btn.setVisible(is_rife_ncnn)
+        self.rife_download_btn.setVisible(is_rife_ncnn)
+        self.rife_model_label.setVisible(is_rife_ncnn)
+        self.rife_model_combo.setVisible(is_rife_ncnn)
+        self.rife_uhd_check.setVisible(is_rife_ncnn)
+        self.rife_tta_check.setVisible(is_rife_ncnn)
+
+        # Practical-RIFE settings
+        self.practical_model_label.setVisible(is_rife_practical)
+        self.practical_model_combo.setVisible(is_rife_practical)
+        self.practical_ensemble_check.setVisible(is_rife_practical)
+        self.practical_setup_btn.setVisible(is_rife_practical)
+        self.practical_status_label.setVisible(is_rife_practical)
+
+        if is_rife_ncnn:
             self._update_rife_download_button()
+
+        if is_rife_practical:
+            self._update_practical_rife_status()
+
+        # Clear blend preview cache when method changes
+        self._blend_preview_cache.clear()
+
+    def _clear_blend_cache(self) -> None:
+        """Clear the blend preview cache."""
+        self._blend_preview_cache.clear()
 
     def _browse_rife_binary(self) -> None:
         """Browse for RIFE binary."""
@@ -743,6 +949,94 @@ class SequenceLinkerUI(QWidget):
             )
             self._update_rife_download_button()
 
+    def _update_practical_rife_status(self) -> None:
+        """Update the Practical-RIFE status label and setup button."""
+        if PracticalRifeEnv.is_setup():
+            torch_version = PracticalRifeEnv.get_torch_version()
+            if torch_version:
+                self.practical_status_label.setText(f"Ready (PyTorch {torch_version})")
+                self.practical_status_label.setStyleSheet("color: green; font-size: 10px;")
+            else:
+                self.practical_status_label.setText("Ready")
+                self.practical_status_label.setStyleSheet("color: green; font-size: 10px;")
+            self.practical_setup_btn.setText("Reinstall")
+            self.practical_setup_btn.setToolTip("Reinstall PyTorch environment")
+            self.practical_model_combo.setEnabled(True)
+            self.practical_ensemble_check.setEnabled(True)
+        else:
+            self.practical_status_label.setText("Not configured")
+            self.practical_status_label.setStyleSheet("color: orange; font-size: 10px;")
+            self.practical_setup_btn.setText("Setup PyTorch")
+            self.practical_setup_btn.setToolTip("Create local venv and install PyTorch (~2GB download)")
+            self.practical_model_combo.setEnabled(False)
+            self.practical_ensemble_check.setEnabled(False)
+
+    def _setup_practical_rife(self) -> None:
+        """Setup Practical-RIFE environment with progress dialog."""
+        # Confirm if already setup
+        if PracticalRifeEnv.is_setup():
+            reply = QMessageBox.question(
+                self, "Reinstall PyTorch?",
+                "PyTorch environment is already set up.\n"
+                "Do you want to reinstall it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        # Create progress dialog
+        progress = QProgressDialog(
+            "Setting up PyTorch environment...", "Cancel", 0, 100, self
+        )
+        progress.setWindowTitle("Setup Practical-RIFE")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        # Progress callback
+        def progress_callback(message, percent):
+            if not progress.wasCanceled():
+                progress.setLabelText(message)
+                progress.setValue(percent)
+                QApplication.processEvents()
+
+        def cancelled_check():
+            QApplication.processEvents()
+            return progress.wasCanceled()
+
+        try:
+            success = PracticalRifeEnv.setup_venv(progress_callback, cancelled_check)
+            progress.close()
+
+            if progress.wasCanceled():
+                self._update_practical_rife_status()
+                return
+
+            if success:
+                QMessageBox.information(
+                    self, "Setup Complete",
+                    "PyTorch environment set up successfully!\n\n"
+                    f"Location: {PracticalRifeEnv.VENV_DIR}\n\n"
+                    "You can now use RIFE (Practical) for frame interpolation."
+                )
+            else:
+                QMessageBox.warning(
+                    self, "Setup Failed",
+                    "Failed to set up PyTorch environment.\n"
+                    "Check your internet connection and try again."
+                )
+
+            self._update_practical_rife_status()
+
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self, "Setup Error",
+                f"Error setting up PyTorch: {e}"
+            )
+            self._update_practical_rife_status()
+
     def _on_sequence_tab_changed(self, index: int) -> None:
         """Handle sequence tab change to update the With Transitions view."""
         if index == 1:  # "With Transitions" tab
@@ -753,10 +1047,12 @@ class SequenceLinkerUI(QWidget):
         self.sequence_table.clear()
 
         if not self.source_folders:
+            self._update_timeline_display()
             return
 
         files = self._get_files_in_order()
         if not files:
+            self._update_timeline_display()
             return
 
         # Group files by folder
@@ -774,6 +1070,7 @@ class SequenceLinkerUI(QWidget):
                 item = QTreeWidgetItem([f"{seq_name} ({filename})", ""])
                 item.setData(0, Qt.ItemDataRole.UserRole, (source_dir, filename, folder_idx, file_idx, 'symlink'))
                 self.sequence_table.addTopLevelItem(item)
+            self._update_timeline_display()
             return
 
         # Get transition specs
@@ -856,6 +1153,9 @@ class SequenceLinkerUI(QWidget):
 
                 self.sequence_table.addTopLevelItem(item)
 
+        # Update timeline display after rebuilding sequence table
+        self._update_timeline_display()
+
     def _on_sequence_table_selected(self, current, previous) -> None:
         """Handle sequence table row selection - show image in preview."""
         if current is None:
@@ -921,20 +1221,6 @@ class SequenceLinkerUI(QWidget):
             return
 
         try:
-            # Load images
-            img_a = Image.open(main_path)
-            img_b = Image.open(trans_path)
-
-            # Resize B to match A if needed
-            if img_a.size != img_b.size:
-                img_b = img_b.resize(img_a.size, Image.Resampling.LANCZOS)
-
-            # Convert to RGBA
-            if img_a.mode != 'RGBA':
-                img_a = img_a.convert('RGBA')
-            if img_b.mode != 'RGBA':
-                img_b = img_b.convert('RGBA')
-
             # Calculate blend factor based on position in sequence table
             # Find this frame's position in the blend sequence
             row_idx = self.sequence_table.indexOfTopLevelItem(item)
@@ -970,17 +1256,51 @@ class SequenceLinkerUI(QWidget):
                 blend_position, blend_count, settings.blend_curve
             )
 
-            # Blend images using selected method
-            if settings.blend_method == BlendMethod.OPTICAL_FLOW:
-                blended = ImageBlender.optical_flow_blend(img_a, img_b, factor)
-            elif settings.blend_method == BlendMethod.RIFE:
-                blended = ImageBlender.rife_blend(img_a, img_b, factor, settings.rife_binary_path)
-            else:
-                blended = Image.blend(img_a, img_b, factor)
+            # Create cache key (include RIFE settings when using RIFE)
+            cache_key = f"{main_path}|{trans_path}|{factor:.6f}|{settings.blend_method.value}|{settings.blend_curve.value}"
+            if settings.blend_method == BlendMethod.RIFE:
+                cache_key += f"|{settings.rife_model}|{settings.rife_uhd}|{settings.rife_tta}"
 
-            # Convert to QPixmap
-            qim = ImageQt(blended.convert('RGBA'))
-            pixmap = QPixmap.fromImage(qim)
+            # Check cache first
+            if cache_key in self._blend_preview_cache:
+                pixmap = self._blend_preview_cache[cache_key]
+            else:
+                # Load images
+                img_a = Image.open(main_path)
+                img_b = Image.open(trans_path)
+
+                # Resize B to match A if needed
+                if img_a.size != img_b.size:
+                    img_b = img_b.resize(img_a.size, Image.Resampling.LANCZOS)
+
+                # Convert to RGBA
+                if img_a.mode != 'RGBA':
+                    img_a = img_a.convert('RGBA')
+                if img_b.mode != 'RGBA':
+                    img_b = img_b.convert('RGBA')
+
+                # Blend images using selected method
+                if settings.blend_method == BlendMethod.OPTICAL_FLOW:
+                    blended = ImageBlender.optical_flow_blend(img_a, img_b, factor)
+                elif settings.blend_method == BlendMethod.RIFE:
+                    blended = ImageBlender.rife_blend(
+                        img_a, img_b, factor, settings.rife_binary_path,
+                        model=settings.rife_model,
+                        uhd=settings.rife_uhd,
+                        tta=settings.rife_tta
+                    )
+                else:
+                    blended = Image.blend(img_a, img_b, factor)
+
+                # Convert to QPixmap
+                qim = ImageQt(blended.convert('RGBA'))
+                pixmap = QPixmap.fromImage(qim)
+
+                # Store in cache
+                self._blend_preview_cache[cache_key] = pixmap
+
+                img_a.close()
+                img_b.close()
 
             self._current_pixmap = pixmap
             self._apply_zoom()
@@ -990,13 +1310,76 @@ class SequenceLinkerUI(QWidget):
             seq_name = f"seq{data0[2] + 1:02d}_{data0[3]:04d}"
             self.image_name_label.setText(f"[B] {seq_name} ({main_file} + {trans_file}) @ {factor:.0%}")
 
-            img_a.close()
-            img_b.close()
-
         except Exception as e:
             self.image_label.setText(f"Error generating blend preview:\n{e}")
             self.image_name_label.setText("")
             self._current_pixmap = None
+
+    def _update_timeline_display(self) -> None:
+        """Update the timeline duration display based on frame count and FPS."""
+        frame_count = self.sequence_table.topLevelItemCount()
+        fps = self.fps_spin.value()
+
+        if fps > 0 and frame_count > 0:
+            total_seconds = frame_count / fps
+            minutes = int(total_seconds // 60)
+            seconds = total_seconds % 60
+            self.timeline_label.setText(
+                f"Duration: {minutes:02d}:{seconds:06.3f} ({frame_count} frames @ {fps}fps)"
+            )
+        else:
+            self.timeline_label.setText("Duration: 00:00.000 (0 frames)")
+
+        # Refresh the sequence table to update timeline background
+        self.sequence_table.viewport().update()
+
+    def _toggle_sequence_play(self) -> None:
+        """Toggle sequence playback."""
+        if self.sequence_playing:
+            self._stop_sequence_play()
+        else:
+            self._start_sequence_play()
+
+    def _start_sequence_play(self) -> None:
+        """Start playing the image sequence."""
+        if self.sequence_table.topLevelItemCount() == 0:
+            return
+
+        fps = self.fps_spin.value()
+        interval = int(1000 / fps)  # milliseconds per frame
+        self.sequence_timer.setInterval(interval)
+        self.sequence_timer.start()
+        self.sequence_playing = True
+        self.seq_play_btn.setText("⏸ Pause")
+
+        # If no item selected, start from first
+        if self.sequence_table.currentItem() is None:
+            first_item = self.sequence_table.topLevelItem(0)
+            if first_item:
+                self.sequence_table.setCurrentItem(first_item)
+
+    def _stop_sequence_play(self) -> None:
+        """Stop sequence playback."""
+        self.sequence_timer.stop()
+        self.sequence_playing = False
+        self.seq_play_btn.setText("▶ Play")
+
+    def _advance_sequence_frame(self) -> None:
+        """Advance to next frame in sequence."""
+        current_item = self.sequence_table.currentItem()
+        if current_item is None:
+            self._stop_sequence_play()
+            return
+
+        current_idx = self.sequence_table.indexOfTopLevelItem(current_item)
+        total = self.sequence_table.topLevelItemCount()
+
+        if current_idx < total - 1:
+            next_item = self.sequence_table.topLevelItem(current_idx + 1)
+            self.sequence_table.setCurrentItem(next_item)
+        else:
+            # Reached end - stop playback
+            self._stop_sequence_play()
 
     def _browse_trans_destination(self) -> None:
         """Select transition destination folder via file dialog."""
@@ -1512,7 +1895,12 @@ class SequenceLinkerUI(QWidget):
             output_quality=self.blend_quality_spin.value(),
             trans_destination=trans_dest,
             blend_method=self.blend_method_combo.currentData(),
-            rife_binary_path=rife_path
+            rife_binary_path=rife_path,
+            rife_model=self.rife_model_combo.currentData(),
+            rife_uhd=self.rife_uhd_check.isChecked(),
+            rife_tta=self.rife_tta_check.isChecked(),
+            practical_rife_model=self.practical_model_combo.currentData(),
+            practical_rife_ensemble=self.practical_ensemble_check.isChecked()
         )
 
     def _refresh_files(self, select_position: str = 'first') -> None:
@@ -1762,6 +2150,9 @@ class SequenceLinkerUI(QWidget):
         video_path = self.video_combo.currentData()
         if video_path and isinstance(video_path, Path) and video_path.exists():
             self.media_player.setSource(QUrl.fromLocalFile(str(video_path)))
+            # Play and immediately pause to show first frame
+            self.media_player.play()
+            self.media_player.pause()
 
     def _toggle_play(self) -> None:
         """Toggle play/pause state."""

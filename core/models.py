@@ -21,7 +21,8 @@ class BlendMethod(Enum):
     """Blend method types for transitions."""
     ALPHA = 'alpha'           # Simple cross-dissolve (PIL.Image.blend)
     OPTICAL_FLOW = 'optical'  # OpenCV Farneback optical flow
-    RIFE = 'rife'             # AI frame interpolation (NCNN binary or PyTorch)
+    RIFE = 'rife'             # AI frame interpolation (NCNN binary)
+    RIFE_PRACTICAL = 'rife_practical'  # Practical-RIFE Python/PyTorch implementation
 
 
 class FolderType(Enum):
@@ -44,6 +45,12 @@ class TransitionSettings:
     trans_destination: Optional[Path] = None  # separate destination for transition output
     blend_method: BlendMethod = BlendMethod.ALPHA  # blending method
     rife_binary_path: Optional[Path] = None  # path to rife-ncnn-vulkan binary
+    rife_model: str = 'rife-v4.6'  # RIFE model to use
+    rife_uhd: bool = False  # Enable UHD mode for high resolution
+    rife_tta: bool = False  # Enable TTA mode for better quality
+    # Practical-RIFE settings
+    practical_rife_model: str = 'v4.25'  # v4.25, v4.26, v4.22, etc.
+    practical_rife_ensemble: bool = False  # Ensemble mode for better quality (slower)
 
 
 @dataclass

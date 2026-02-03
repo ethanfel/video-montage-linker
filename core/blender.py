@@ -29,6 +29,214 @@ from .models import (
 # Cache directory for downloaded binaries
 CACHE_DIR = Path.home() / '.cache' / 'video-montage-linker'
 RIFE_GITHUB_API = 'https://api.github.com/repos/nihui/rife-ncnn-vulkan/releases/latest'
+PRACTICAL_RIFE_VENV_DIR = Path('./venv-rife')
+
+
+class PracticalRifeEnv:
+    """Manages isolated Python environment for Practical-RIFE."""
+
+    VENV_DIR = PRACTICAL_RIFE_VENV_DIR
+    MODEL_CACHE_DIR = CACHE_DIR / 'practical-rife'
+    REQUIRED_PACKAGES = ['torch', 'torchvision', 'numpy']
+
+    # Available Practical-RIFE models
+    AVAILABLE_MODELS = ['v4.26', 'v4.25', 'v4.22', 'v4.20', 'v4.18', 'v4.15']
+
+    @classmethod
+    def get_venv_python(cls) -> Optional[Path]:
+        """Get path to venv Python executable."""
+        if cls.VENV_DIR.exists():
+            if sys.platform == 'win32':
+                return cls.VENV_DIR / 'Scripts' / 'python.exe'
+            return cls.VENV_DIR / 'bin' / 'python'
+        return None
+
+    @classmethod
+    def is_setup(cls) -> bool:
+        """Check if venv exists and has required packages."""
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            return False
+        # Check if torch is importable
+        result = subprocess.run(
+            [str(python), '-c', 'import torch; print(torch.__version__)'],
+            capture_output=True
+        )
+        return result.returncode == 0
+
+    @classmethod
+    def get_torch_version(cls) -> Optional[str]:
+        """Get installed torch version in venv."""
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            return None
+        result = subprocess.run(
+            [str(python), '-c', 'import torch; print(torch.__version__)'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        return None
+
+    @classmethod
+    def setup_venv(cls, progress_callback=None, cancelled_check=None) -> bool:
+        """Create venv and install PyTorch.
+
+        Args:
+            progress_callback: Optional callback(message, percent) for progress.
+            cancelled_check: Optional callable that returns True if cancelled.
+
+        Returns:
+            True if setup was successful.
+        """
+        import venv
+
+        try:
+            # 1. Create venv
+            if progress_callback:
+                progress_callback("Creating virtual environment...", 10)
+            if cancelled_check and cancelled_check():
+                return False
+
+            # Remove old venv if exists
+            if cls.VENV_DIR.exists():
+                shutil.rmtree(cls.VENV_DIR)
+
+            venv.create(cls.VENV_DIR, with_pip=True)
+
+            # 2. Get pip path
+            python = cls.get_venv_python()
+            if not python:
+                return False
+
+            # 3. Upgrade pip
+            if progress_callback:
+                progress_callback("Upgrading pip...", 20)
+            if cancelled_check and cancelled_check():
+                return False
+
+            subprocess.run(
+                [str(python), '-m', 'pip', 'install', '--upgrade', 'pip'],
+                capture_output=True,
+                check=True
+            )
+
+            # 4. Install PyTorch (this is the big download)
+            if progress_callback:
+                progress_callback("Installing PyTorch (this may take a while)...", 30)
+            if cancelled_check and cancelled_check():
+                return False
+
+            # Try to install with CUDA support first, fall back to CPU
+            # Use pip index to get the right version
+            result = subprocess.run(
+                [str(python), '-m', 'pip', 'install', 'torch', 'torchvision'],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0:
+                # Try CPU-only version
+                subprocess.run(
+                    [str(python), '-m', 'pip', 'install',
+                     'torch', 'torchvision',
+                     '--index-url', 'https://download.pytorch.org/whl/cpu'],
+                    capture_output=True,
+                    check=True
+                )
+
+            if progress_callback:
+                progress_callback("Installing numpy...", 90)
+            if cancelled_check and cancelled_check():
+                return False
+
+            # numpy is usually a dependency of torch but ensure it's there
+            subprocess.run(
+                [str(python), '-m', 'pip', 'install', 'numpy'],
+                capture_output=True
+            )
+
+            if progress_callback:
+                progress_callback("Setup complete!", 100)
+
+            return cls.is_setup()
+
+        except Exception as e:
+            # Cleanup on error
+            if cls.VENV_DIR.exists():
+                try:
+                    shutil.rmtree(cls.VENV_DIR)
+                except Exception:
+                    pass
+            return False
+
+    @classmethod
+    def get_available_models(cls) -> list[str]:
+        """Return list of available model versions."""
+        return cls.AVAILABLE_MODELS.copy()
+
+    @classmethod
+    def get_worker_script(cls) -> Path:
+        """Get path to the RIFE worker script."""
+        return Path(__file__).parent / 'rife_worker.py'
+
+    @classmethod
+    def run_interpolation(
+        cls,
+        img_a_path: Path,
+        img_b_path: Path,
+        output_path: Path,
+        t: float,
+        model: str = 'v4.25',
+        ensemble: bool = False
+    ) -> bool:
+        """Run RIFE interpolation via subprocess in venv.
+
+        Args:
+            img_a_path: Path to first input image.
+            img_b_path: Path to second input image.
+            output_path: Path to output image.
+            t: Timestep for interpolation (0.0 to 1.0).
+            model: Model version to use.
+            ensemble: Enable ensemble mode.
+
+        Returns:
+            True if interpolation succeeded.
+        """
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            return False
+
+        script = cls.get_worker_script()
+        if not script.exists():
+            return False
+
+        cmd = [
+            str(python), str(script),
+            '--input0', str(img_a_path),
+            '--input1', str(img_b_path),
+            '--output', str(output_path),
+            '--timestep', str(t),
+            '--model', model,
+            '--model-dir', str(cls.MODEL_CACHE_DIR)
+        ]
+
+        if ensemble:
+            cmd.append('--ensemble')
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120  # 2 minute timeout per frame
+            )
+            return result.returncode == 0 and output_path.exists()
+        except subprocess.TimeoutExpired:
+            return False
+        except Exception:
+            return False
 
 
 class RifeDownloader:
@@ -398,7 +606,10 @@ class ImageBlender:
         img_b: Image.Image,
         t: float,
         binary_path: Optional[Path] = None,
-        auto_download: bool = True
+        auto_download: bool = True,
+        model: str = 'rife-v4.6',
+        uhd: bool = False,
+        tta: bool = False
     ) -> Image.Image:
         """Blend using RIFE AI frame interpolation.
 
@@ -411,27 +622,30 @@ class ImageBlender:
             t: Interpolation factor 0.0 (100% A) to 1.0 (100% B).
             binary_path: Optional path to rife-ncnn-vulkan binary.
             auto_download: Whether to auto-download RIFE if not found.
+            model: RIFE model to use (e.g., 'rife-v4.6', 'rife-anime').
+            uhd: Enable UHD mode for high resolution images.
+            tta: Enable TTA mode for better quality (slower).
 
         Returns:
             AI-interpolated blended PIL Image.
         """
         # Try NCNN binary first (specified path)
         if binary_path and binary_path.exists():
-            result = ImageBlender._rife_ncnn(img_a, img_b, t, binary_path)
+            result = ImageBlender._rife_ncnn(img_a, img_b, t, binary_path, model, uhd, tta)
             if result is not None:
                 return result
 
         # Try to find rife-ncnn-vulkan in PATH
         ncnn_path = shutil.which('rife-ncnn-vulkan')
         if ncnn_path:
-            result = ImageBlender._rife_ncnn(img_a, img_b, t, Path(ncnn_path))
+            result = ImageBlender._rife_ncnn(img_a, img_b, t, Path(ncnn_path), model, uhd, tta)
             if result is not None:
                 return result
 
         # Try cached binary
         cached = RifeDownloader.get_cached_binary()
         if cached:
-            result = ImageBlender._rife_ncnn(img_a, img_b, t, cached)
+            result = ImageBlender._rife_ncnn(img_a, img_b, t, cached, model, uhd, tta)
             if result is not None:
                 return result
 
@@ -439,7 +653,7 @@ class ImageBlender:
         if auto_download:
             downloaded = RifeDownloader.ensure_binary()
             if downloaded:
-                result = ImageBlender._rife_ncnn(img_a, img_b, t, downloaded)
+                result = ImageBlender._rife_ncnn(img_a, img_b, t, downloaded, model, uhd, tta)
                 if result is not None:
                     return result
 
@@ -451,7 +665,10 @@ class ImageBlender:
         img_a: Image.Image,
         img_b: Image.Image,
         t: float,
-        binary: Path
+        binary: Path,
+        model: str = 'rife-v4.6',
+        uhd: bool = False,
+        tta: bool = False
     ) -> Optional[Image.Image]:
         """Use rife-ncnn-vulkan binary for interpolation.
 
@@ -460,6 +677,9 @@ class ImageBlender:
             img_b: Second PIL Image.
             t: Interpolation timestep (0.0 to 1.0).
             binary: Path to rife-ncnn-vulkan binary.
+            model: RIFE model to use.
+            uhd: Enable UHD mode.
+            tta: Enable TTA mode.
 
         Returns:
             Interpolated PIL Image, or None if failed.
@@ -485,6 +705,19 @@ class ImageBlender:
                     '-o', str(output_file),
                 ]
 
+                # Add model path (models are in same directory as binary)
+                model_path = binary.parent / model
+                if model_path.exists():
+                    cmd.extend(['-m', str(model_path)])
+
+                # Add UHD mode flag
+                if uhd:
+                    cmd.append('-u')
+
+                # Add TTA mode flag (spatial)
+                if tta:
+                    cmd.append('-x')
+
                 # Some versions support -s for timestep
                 # Try with timestep first, fall back to simple interpolation
                 try:
@@ -492,7 +725,7 @@ class ImageBlender:
                         cmd + ['-s', str(t)],
                         check=True,
                         capture_output=True,
-                        timeout=30
+                        timeout=60  # Increased timeout for TTA mode
                     )
                 except subprocess.CalledProcessError:
                     # Try without timestep (generates middle frame at t=0.5)
@@ -500,7 +733,7 @@ class ImageBlender:
                         cmd,
                         check=True,
                         capture_output=True,
-                        timeout=30
+                        timeout=60
                     )
 
                 if output_file.exists():
@@ -512,6 +745,58 @@ class ImageBlender:
         return None
 
     @staticmethod
+    def practical_rife_blend(
+        img_a: Image.Image,
+        img_b: Image.Image,
+        t: float,
+        model: str = 'v4.25',
+        ensemble: bool = False
+    ) -> Image.Image:
+        """Blend using Practical-RIFE Python/PyTorch implementation.
+
+        Runs RIFE interpolation via subprocess in an isolated venv.
+        Falls back to ncnn RIFE or optical flow if unavailable.
+
+        Args:
+            img_a: First PIL Image (source frame).
+            img_b: Second PIL Image (target frame).
+            t: Interpolation factor 0.0 (100% A) to 1.0 (100% B).
+            model: Practical-RIFE model version (e.g., 'v4.25', 'v4.26').
+            ensemble: Enable ensemble mode for better quality (slower).
+
+        Returns:
+            AI-interpolated blended PIL Image.
+        """
+        if not PracticalRifeEnv.is_setup():
+            # Fall back to ncnn RIFE or optical flow
+            return ImageBlender.rife_blend(img_a, img_b, t)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                input_a = tmp / 'a.png'
+                input_b = tmp / 'b.png'
+                output_file = tmp / 'out.png'
+
+                # Save input images
+                img_a.convert('RGB').save(input_a)
+                img_b.convert('RGB').save(input_b)
+
+                # Run Practical-RIFE via subprocess
+                success = PracticalRifeEnv.run_interpolation(
+                    input_a, input_b, output_file, t, model, ensemble
+                )
+
+                if success and output_file.exists():
+                    return Image.open(output_file).copy()
+
+        except Exception:
+            pass
+
+        # Fall back to ncnn RIFE or optical flow
+        return ImageBlender.rife_blend(img_a, img_b, t)
+
+    @staticmethod
     def blend_images(
         img_a_path: Path,
         img_b_path: Path,
@@ -521,7 +806,12 @@ class ImageBlender:
         output_quality: int = 95,
         webp_method: int = 4,
         blend_method: BlendMethod = BlendMethod.ALPHA,
-        rife_binary_path: Optional[Path] = None
+        rife_binary_path: Optional[Path] = None,
+        rife_model: str = 'rife-v4.6',
+        rife_uhd: bool = False,
+        rife_tta: bool = False,
+        practical_rife_model: str = 'v4.25',
+        practical_rife_ensemble: bool = False
     ) -> BlendResult:
         """Blend two images together.
 
@@ -533,8 +823,13 @@ class ImageBlender:
             output_format: Output format (png, jpeg, webp).
             output_quality: Quality for JPEG output (1-100).
             webp_method: WebP compression method (0-6, higher = smaller but slower).
-            blend_method: The blending method to use (alpha, optical_flow, or rife).
+            blend_method: The blending method to use (alpha, optical_flow, rife, rife_practical).
             rife_binary_path: Optional path to rife-ncnn-vulkan binary.
+            rife_model: RIFE ncnn model to use (e.g., 'rife-v4.6').
+            rife_uhd: Enable RIFE ncnn UHD mode.
+            rife_tta: Enable RIFE ncnn TTA mode.
+            practical_rife_model: Practical-RIFE model version (e.g., 'v4.25').
+            practical_rife_ensemble: Enable Practical-RIFE ensemble mode.
 
         Returns:
             BlendResult with operation status.
@@ -557,7 +852,13 @@ class ImageBlender:
             if blend_method == BlendMethod.OPTICAL_FLOW:
                 blended = ImageBlender.optical_flow_blend(img_a, img_b, factor)
             elif blend_method == BlendMethod.RIFE:
-                blended = ImageBlender.rife_blend(img_a, img_b, factor, rife_binary_path)
+                blended = ImageBlender.rife_blend(
+                    img_a, img_b, factor, rife_binary_path, True, rife_model, rife_uhd, rife_tta
+                )
+            elif blend_method == BlendMethod.RIFE_PRACTICAL:
+                blended = ImageBlender.practical_rife_blend(
+                    img_a, img_b, factor, practical_rife_model, practical_rife_ensemble
+                )
             else:
                 # Default: simple alpha blend
                 blended = Image.blend(img_a, img_b, factor)
@@ -610,7 +911,12 @@ class ImageBlender:
         output_quality: int = 95,
         webp_method: int = 4,
         blend_method: BlendMethod = BlendMethod.ALPHA,
-        rife_binary_path: Optional[Path] = None
+        rife_binary_path: Optional[Path] = None,
+        rife_model: str = 'rife-v4.6',
+        rife_uhd: bool = False,
+        rife_tta: bool = False,
+        practical_rife_model: str = 'v4.25',
+        practical_rife_ensemble: bool = False
     ) -> BlendResult:
         """Blend two PIL Image objects together.
 
@@ -622,8 +928,13 @@ class ImageBlender:
             output_format: Output format (png, jpeg, webp).
             output_quality: Quality for JPEG output (1-100).
             webp_method: WebP compression method (0-6).
-            blend_method: The blending method to use (alpha, optical_flow, or rife).
+            blend_method: The blending method to use (alpha, optical_flow, rife, rife_practical).
             rife_binary_path: Optional path to rife-ncnn-vulkan binary.
+            rife_model: RIFE ncnn model to use (e.g., 'rife-v4.6').
+            rife_uhd: Enable RIFE ncnn UHD mode.
+            rife_tta: Enable RIFE ncnn TTA mode.
+            practical_rife_model: Practical-RIFE model version (e.g., 'v4.25').
+            practical_rife_ensemble: Enable Practical-RIFE ensemble mode.
 
         Returns:
             BlendResult with operation status.
@@ -643,7 +954,13 @@ class ImageBlender:
             if blend_method == BlendMethod.OPTICAL_FLOW:
                 blended = ImageBlender.optical_flow_blend(img_a, img_b, factor)
             elif blend_method == BlendMethod.RIFE:
-                blended = ImageBlender.rife_blend(img_a, img_b, factor, rife_binary_path)
+                blended = ImageBlender.rife_blend(
+                    img_a, img_b, factor, rife_binary_path, True, rife_model, rife_uhd, rife_tta
+                )
+            elif blend_method == BlendMethod.RIFE_PRACTICAL:
+                blended = ImageBlender.practical_rife_blend(
+                    img_a, img_b, factor, practical_rife_model, practical_rife_ensemble
+                )
             else:
                 # Default: simple alpha blend
                 blended = Image.blend(img_a, img_b, factor)
@@ -887,7 +1204,12 @@ class TransitionGenerator:
                 self.settings.output_quality,
                 self.settings.webp_method,
                 self.settings.blend_method,
-                self.settings.rife_binary_path
+                self.settings.rife_binary_path,
+                self.settings.rife_model,
+                self.settings.rife_uhd,
+                self.settings.rife_tta,
+                self.settings.practical_rife_model,
+                self.settings.practical_rife_ensemble
             )
             results.append(result)
 

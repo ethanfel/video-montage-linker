@@ -1462,7 +1462,7 @@ class TransitionGenerator:
         spec: TransitionSpec,
         dest: Path,
         folder_idx_main: int,
-        base_file_idx: int
+        base_seq_num: int
     ) -> list[BlendResult]:
         """Generate blended frames for an asymmetric transition.
 
@@ -1473,8 +1473,8 @@ class TransitionGenerator:
         Args:
             spec: TransitionSpec describing the transition.
             dest: Destination directory for blended frames.
-            folder_idx_main: Folder index for sequence naming.
-            base_file_idx: Starting file index for sequence naming.
+            folder_idx_main: Folder index (unused, kept for compatibility).
+            base_seq_num: Starting sequence number for continuous naming.
 
         Returns:
             List of BlendResult objects.
@@ -1529,8 +1529,8 @@ class TransitionGenerator:
 
             # Generate output filename
             ext = f".{self.settings.output_format.lower()}"
-            file_idx = base_file_idx + i
-            output_name = f"seq{folder_idx_main + 1:02d}_{file_idx:04d}{ext}"
+            seq_num = base_seq_num + i
+            output_name = f"seq_{seq_num:05d}{ext}"
             output_path = dest / output_name
 
             result = self.blender.blend_images_pil(
@@ -1569,7 +1569,7 @@ class TransitionGenerator:
         spec: TransitionSpec,
         dest: Path,
         folder_idx_main: int,
-        base_file_idx: int
+        base_seq_num: int
     ) -> list[BlendResult]:
         """Generate blended frames for a transition.
 
@@ -1578,15 +1578,15 @@ class TransitionGenerator:
         Args:
             spec: TransitionSpec describing the transition.
             dest: Destination directory for blended frames.
-            folder_idx_main: Folder index for sequence naming.
-            base_file_idx: Starting file index for sequence naming.
+            folder_idx_main: Folder index (unused, kept for compatibility).
+            base_seq_num: Starting sequence number for continuous naming.
 
         Returns:
             List of BlendResult objects.
         """
         # Use asymmetric blend for all cases (handles symmetric too)
         return self.generate_asymmetric_blend_frames(
-            spec, dest, folder_idx_main, base_file_idx
+            spec, dest, folder_idx_main, base_seq_num
         )
 
     def generate_direct_interpolation_frames(
@@ -1597,7 +1597,7 @@ class TransitionGenerator:
         method: DirectInterpolationMethod,
         dest: Path,
         folder_idx: int,
-        base_file_idx: int,
+        base_seq_num: int,
         practical_rife_model: str = 'v4.25',
         practical_rife_ensemble: bool = False
     ) -> list[BlendResult]:
@@ -1615,8 +1615,8 @@ class TransitionGenerator:
             frame_count: Number of interpolated frames to generate.
             method: Interpolation method (RIFE or FILM).
             dest: Destination directory for generated frames.
-            folder_idx: Folder index for sequence naming.
-            base_file_idx: Starting file index for sequence naming.
+            folder_idx: Folder index (unused, kept for compatibility).
+            base_seq_num: Starting sequence number for continuous naming.
             practical_rife_model: Practical-RIFE model version.
             practical_rife_ensemble: Enable Practical-RIFE ensemble mode.
 
@@ -1629,7 +1629,7 @@ class TransitionGenerator:
         # For FILM, use batch mode to generate all frames at once
         if method == DirectInterpolationMethod.FILM and FilmEnv.is_setup():
             return self._generate_film_frames_batch(
-                img_a_path, img_b_path, frame_count, dest, folder_idx, base_file_idx
+                img_a_path, img_b_path, frame_count, dest, base_seq_num
             )
 
         # For RIFE (or FILM fallback), generate frames one at a time
@@ -1662,8 +1662,8 @@ class TransitionGenerator:
 
             # Generate output filename
             ext = f".{self.settings.output_format.lower()}"
-            file_idx = base_file_idx + i
-            output_name = f"seq{folder_idx + 1:02d}_trans_{file_idx:04d}{ext}"
+            seq_num = base_seq_num + i
+            output_name = f"seq_{seq_num:05d}{ext}"
             output_path = dest / output_name
 
             # Save the blended frame
@@ -1713,8 +1713,7 @@ class TransitionGenerator:
         img_b_path: Path,
         frame_count: int,
         dest: Path,
-        folder_idx: int,
-        base_file_idx: int
+        base_seq_num: int
     ) -> list[BlendResult]:
         """Generate FILM frames using batch mode for better quality.
 
@@ -1726,8 +1725,7 @@ class TransitionGenerator:
             img_b_path: Path to first frame of second sequence.
             frame_count: Number of interpolated frames to generate.
             dest: Destination directory for generated frames.
-            folder_idx: Folder index for sequence naming.
-            base_file_idx: Starting file index for sequence naming.
+            base_seq_num: Starting sequence number for continuous naming.
 
         Returns:
             List of BlendResult objects.
@@ -1751,8 +1749,8 @@ class TransitionGenerator:
             for i in range(frame_count):
                 t = (i + 1) / (frame_count + 1)
                 ext = f".{self.settings.output_format.lower()}"
-                file_idx = base_file_idx + i
-                output_name = f"seq{folder_idx + 1:02d}_trans_{file_idx:04d}{ext}"
+                seq_num = base_seq_num + i
+                output_name = f"seq_{seq_num:05d}{ext}"
                 output_path = dest / output_name
 
                 results.append(BlendResult(
@@ -1769,8 +1767,8 @@ class TransitionGenerator:
         for i, temp_path in enumerate(temp_paths):
             t = (i + 1) / (frame_count + 1)
             ext = f".{self.settings.output_format.lower()}"
-            file_idx = base_file_idx + i
-            output_name = f"seq{folder_idx + 1:02d}_trans_{file_idx:04d}{ext}"
+            seq_num = base_seq_num + i
+            output_name = f"seq_{seq_num:05d}{ext}"
             output_path = dest / output_name
 
             try:

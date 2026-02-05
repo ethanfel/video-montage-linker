@@ -1505,6 +1505,7 @@ class SequenceLinkerUI(QWidget):
                     consecutive_main_pairs.append((i, i + 1))
 
         # Process each folder
+        output_seq = 0  # Track continuous sequence number for preview
         for folder_idx, folder in enumerate(self.source_folders):
             folder_files = files_by_folder.get(folder, [])
             if not folder_files:
@@ -1536,7 +1537,7 @@ class SequenceLinkerUI(QWidget):
                         # These frames are consumed by the blend - skip them
                         continue
 
-                seq_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}"
+                seq_name = f"seq_{output_seq:05d}"
 
                 if should_blend and blend_trans:
                     # Calculate which trans frame this blends with
@@ -1551,19 +1552,21 @@ class SequenceLinkerUI(QWidget):
                     trans_text = f"→ {trans_file}"
 
                     item = QTreeWidgetItem([main_text, trans_text])
-                    item.setData(0, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'blend'))
+                    item.setData(0, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'blend', output_seq))
                     item.setData(1, Qt.ItemDataRole.UserRole, (blend_trans.trans_folder, trans_file))
                     # Blue color for blend frames
                     item.setForeground(0, QColor(100, 150, 255))
                     item.setForeground(1, QColor(100, 150, 255))
+                    output_seq += 1
                 elif folder_type == FolderType.TRANSITION:
-                    # Transition folder files go in Transition column only
-                    item = QTreeWidgetItem(["", f"{seq_name} ({filename})"])
-                    item.setData(1, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'symlink'))
+                    # Transition folder files go in Transition column only (no output file)
+                    item = QTreeWidgetItem(["", f"({filename})"])
+                    item.setData(1, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'symlink', -1))
                 else:
                     # Main folder files go in Main column only
                     item = QTreeWidgetItem([f"{seq_name} ({filename})", ""])
-                    item.setData(0, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'symlink'))
+                    item.setData(0, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'symlink', output_seq))
+                    output_seq += 1
 
                 self.sequence_table.addTopLevelItem(item)
 
@@ -1680,7 +1683,11 @@ class SequenceLinkerUI(QWidget):
             total = self.sequence_table.topLevelItemCount()
             self.image_index_label.setText(f"{row_idx + 1} / {total}")
 
-            seq_name = f"seq{data[2] + 1:02d}_{data[3]:04d}"
+            # Use continuous format for transitions, folder-based for regular export
+            if self.transition_group.isChecked() and len(data) > 5 and data[5] >= 0:
+                seq_name = f"seq_{data[5]:05d}"
+            else:
+                seq_name = f"seq{data[2] + 1:02d}_{data[3]:04d}"
             self.image_name_label.setText(f"{seq_name} ({filename})")
 
     def _on_sequence_table_clicked(self, item, column: int) -> None:
@@ -1825,7 +1832,9 @@ class SequenceLinkerUI(QWidget):
 
             # Update labels
             self.image_index_label.setText(f"{row_idx + 1} / {total}")
-            seq_name = f"seq{data0[2] + 1:02d}_{data0[3]:04d}"
+            # Use continuous format for blend frames (always with transitions)
+            output_seq_num = data0[5] if len(data0) > 5 else row_idx
+            seq_name = f"seq_{output_seq_num:05d}"
             self.image_name_label.setText(f"[B] {seq_name} ({main_file} + {trans_file}) @ {factor:.0%}")
 
         except Exception as e:
@@ -2528,10 +2537,13 @@ class SequenceLinkerUI(QWidget):
         db_transition_settings = self.db.get_transition_settings(latest_session.id)
         db_per_trans_settings = self.db.get_all_per_transition_settings(latest_session.id)
 
-        new_pattern = re.compile(r'seq(\d+)_(\d+)')
-        old_pattern = re.compile(r'seq_(\d+)')
+        # Pattern for new continuous format: seq_00000
+        continuous_pattern = re.compile(r'seq_(\d+)')
+        # Pattern for old folder-based format: seq01_0000
+        folder_pattern = re.compile(r'seq(\d+)_(\d+)')
 
         folder_data: dict[str, tuple[int, list[tuple[int, str]]]] = {}
+        folder_first_seq: dict[str, int] = {}  # Track first sequence number per folder
         missing_count = 0
 
         for link in symlinks:
@@ -2543,22 +2555,35 @@ class SequenceLinkerUI(QWidget):
             folder = str(source_path.parent)
             link_name = Path(link.link_path).stem
 
-            match = new_pattern.match(link_name)
+            # Try continuous format first (new format)
+            match = continuous_pattern.match(link_name)
             if match:
-                folder_idx = int(match.group(1)) - 1
-                file_idx = int(match.group(2))
+                seq_num = int(match.group(1))
+                # Use sequence number for ordering, folder from source_path
+                if folder not in folder_first_seq:
+                    folder_first_seq[folder] = seq_num
+                file_idx = seq_num
             else:
-                match = old_pattern.match(link_name)
+                # Try old folder-based format
+                match = folder_pattern.match(link_name)
                 if match:
-                    folder_idx = 0
-                    file_idx = int(match.group(1))
+                    folder_idx_from_name = int(match.group(1)) - 1
+                    file_idx = int(match.group(2))
+                    if folder not in folder_first_seq:
+                        folder_first_seq[folder] = folder_idx_from_name * 10000 + file_idx
                 else:
-                    folder_idx = 0
+                    # Fallback to database sequence number
                     file_idx = link.sequence_number
+                    if folder not in folder_first_seq:
+                        folder_first_seq[folder] = file_idx
 
             if folder not in folder_data:
-                folder_data[folder] = (folder_idx, [])
+                folder_data[folder] = (0, [])  # folder_idx will be set later
             folder_data[folder][1].append((file_idx, link.original_filename))
+
+        # Sort folders by their first sequence number to maintain order
+        for folder in folder_data:
+            folder_data[folder] = (folder_first_seq.get(folder, 0), folder_data[folder][1])
 
         if not folder_data:
             return False
@@ -2622,7 +2647,8 @@ class SequenceLinkerUI(QWidget):
         self._current_session_id = latest_session.id
 
         self._sync_dual_lists()
-        self._refresh_files()
+        # Restore exact files from session instead of refreshing from disk
+        self._restore_files_from_session(folder_data)
         self._update_flow_arrows()
 
         total_files = self.file_list.topLevelItemCount()
@@ -2948,6 +2974,67 @@ class SequenceLinkerUI(QWidget):
                 self.file_list.setCurrentItem(self.file_list.topLevelItem(total - 1))
             else:
                 self.file_list.setCurrentItem(self.file_list.topLevelItem(0))
+
+        self._update_trim_slider_for_selected_folder()
+        self._update_sequence_table()
+
+    def _restore_files_from_session(
+        self,
+        folder_data: dict[str, tuple[int, list[tuple[int, str]]]]
+    ) -> None:
+        """Restore file list from session data, preserving exact sequence.
+
+        Args:
+            folder_data: Dict mapping folder paths to (folder_idx, [(file_idx, filename), ...])
+        """
+        self.file_list.clear()
+        if not folder_data:
+            self._folder_file_counts.clear()
+            return
+
+        # Sort folders by their index
+        sorted_folders = sorted(folder_data.items(), key=lambda x: x[1][0])
+
+        self._folder_file_counts = {}
+        is_first_folder = True
+
+        for folder_str, (folder_idx, file_list) in sorted_folders:
+            folder_path = Path(folder_str)
+            if not folder_path.exists():
+                continue
+
+            # Sort files by their sequence index
+            sorted_files = sorted(file_list, key=lambda x: x[0])
+
+            # Filter to only files that still exist
+            existing_files = [
+                (idx, fname) for idx, fname in sorted_files
+                if (folder_path / fname).exists()
+            ]
+
+            if not existing_files:
+                continue
+
+            self._folder_file_counts[folder_path] = len(existing_files)
+
+            # Add separator between folders (not before first)
+            if not is_first_folder:
+                separator = self._create_folder_separator(folder_idx)
+                self.file_list.addTopLevelItem(separator)
+            is_first_folder = False
+
+            for file_idx, filename in existing_files:
+                ext = Path(filename).suffix
+                seq_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
+
+                item = QTreeWidgetItem([seq_name, filename, str(folder_path)])
+                item.setData(0, Qt.ItemDataRole.UserRole, (folder_path, filename, folder_idx, file_idx))
+                self.file_list.addTopLevelItem(item)
+
+        total = self.file_list.topLevelItemCount()
+        self.image_slider.setRange(0, max(0, total - 1))
+        if total > 0:
+            self.file_list.setCurrentItem(self.file_list.topLevelItem(0))
 
         self._update_trim_slider_for_selected_folder()
         self._update_sequence_table()
@@ -3576,7 +3663,7 @@ class SequenceLinkerUI(QWidget):
                     )
 
                     ext = f".{settings.output_format.lower()}"
-                    output_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
+                    output_name = f"seq_{output_seq:05d}{ext}"
                     output_path = trans_dest / output_name
 
                     result = generator.blender.blend_images(
@@ -3600,7 +3687,7 @@ class SequenceLinkerUI(QWidget):
                     output_seq += 1
                 else:
                     ext = source_path.suffix
-                    link_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
+                    link_name = f"seq_{output_seq:05d}{ext}"
                     link_path = symlink_dest / link_name
 
                     rel_source = Path(os.path.relpath(source_path.resolve(), symlink_dest.resolve()))

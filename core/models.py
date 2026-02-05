@@ -32,6 +32,12 @@ class FolderType(Enum):
     TRANSITION = 'transition'
 
 
+class DirectInterpolationMethod(Enum):
+    """Method for direct frame interpolation between sequences."""
+    RIFE = 'rife'
+    FILM = 'film'
+
+
 # --- Data Classes ---
 
 @dataclass
@@ -66,6 +72,15 @@ class PerTransitionSettings:
     trans_folder: Path
     left_overlap: int = 16   # frames from main folder end
     right_overlap: int = 16  # frames from trans folder start
+
+
+@dataclass
+class DirectTransitionSettings:
+    """Settings for direct AI interpolation between sequences (no transition folder)."""
+    after_folder: Path  # The folder after which this transition occurs
+    frame_count: int = 16  # Number of interpolated frames to generate
+    method: DirectInterpolationMethod = DirectInterpolationMethod.FILM
+    enabled: bool = True
 
 
 @dataclass

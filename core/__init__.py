@@ -4,8 +4,10 @@ from .models import (
     BlendCurve,
     BlendMethod,
     FolderType,
+    DirectInterpolationMethod,
     TransitionSettings,
     PerTransitionSettings,
+    DirectTransitionSettings,
     BlendResult,
     TransitionSpec,
     LinkResult,
@@ -19,15 +21,17 @@ from .models import (
     DatabaseError,
 )
 from .database import DatabaseManager
-from .blender import ImageBlender, TransitionGenerator, RifeDownloader, PracticalRifeEnv, OPTICAL_FLOW_PRESETS
+from .blender import ImageBlender, TransitionGenerator, RifeDownloader, PracticalRifeEnv, FilmEnv, OPTICAL_FLOW_PRESETS
 from .manager import SymlinkManager
 
 __all__ = [
     'BlendCurve',
     'BlendMethod',
     'FolderType',
+    'DirectInterpolationMethod',
     'TransitionSettings',
     'PerTransitionSettings',
+    'DirectTransitionSettings',
     'BlendResult',
     'TransitionSpec',
     'LinkResult',
@@ -44,6 +48,7 @@ __all__ = [
     'TransitionGenerator',
     'RifeDownloader',
     'PracticalRifeEnv',
+    'FilmEnv',
     'SymlinkManager',
     'OPTICAL_FLOW_PRESETS',
 ]

@@ -49,14 +49,17 @@ from core import (
     BlendCurve,
     BlendMethod,
     FolderType,
+    DirectInterpolationMethod,
     TransitionSettings,
     PerTransitionSettings,
+    DirectTransitionSettings,
     TransitionSpec,
     SymlinkError,
     DatabaseManager,
     TransitionGenerator,
     RifeDownloader,
     PracticalRifeEnv,
+    FilmEnv,
     SymlinkManager,
     OPTICAL_FLOW_PRESETS,
 )
@@ -196,6 +199,216 @@ class OverlapDialog(QDialog):
         return self.left_spin.value(), self.right_spin.value()
 
 
+class DirectTransitionDialog(QDialog):
+    """Dialog for configuring direct frame interpolation between MAIN sequences."""
+
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        folder_name: str,
+        frame_count: int = 16,
+        method: DirectInterpolationMethod = DirectInterpolationMethod.FILM,
+        enabled: bool = True
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Direct Interpolation Settings")
+        self.setMinimumWidth(350)
+
+        layout = QVBoxLayout(self)
+
+        # Info label
+        info_label = QLabel(f"Interpolate after: {folder_name}")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Form for settings
+        form_layout = QFormLayout()
+
+        # Method selection
+        self.method_combo = QComboBox()
+        self.method_combo.addItem("RIFE (Fast, small motion)", DirectInterpolationMethod.RIFE)
+        self.method_combo.addItem("FILM (Slow, large motion)", DirectInterpolationMethod.FILM)
+        if method == DirectInterpolationMethod.FILM:
+            self.method_combo.setCurrentIndex(1)
+        form_layout.addRow("Method:", self.method_combo)
+
+        # Frame count
+        self.frame_spin = QSpinBox()
+        self.frame_spin.setRange(1, 60)
+        self.frame_spin.setValue(frame_count)
+        self.frame_spin.setToolTip("Number of interpolated frames to generate")
+        form_layout.addRow("Frames:", self.frame_spin)
+
+        # Enable checkbox
+        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check.setChecked(enabled)
+        form_layout.addRow("", self.enabled_check)
+
+        layout.addLayout(form_layout)
+
+        # Status label for setup state
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("font-size: 10px;")
+        layout.addWidget(self.status_label)
+
+        # Setup button (for installing RIFE/FILM)
+        self.setup_btn = QPushButton("Setup PyTorch Environment")
+        self.setup_btn.setToolTip("Install PyTorch and required packages")
+        self.setup_btn.clicked.connect(self._on_setup)
+        layout.addWidget(self.setup_btn)
+
+        # Explanation
+        explain = QLabel(
+            "RIFE: Fast AI interpolation, best for small motion and color shifts.\n"
+            "FILM: Google Research model, better for large motion and scene gaps.\n\n"
+            "Generated frames bridge the gap between the last frame of this\n"
+            "sequence and the first frame of the next MAIN sequence."
+        )
+        explain.setStyleSheet("color: gray; font-size: 10px;")
+        explain.setWordWrap(True)
+        layout.addWidget(explain)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+
+        self.remove_btn = QPushButton("Remove")
+        self.remove_btn.setToolTip("Remove this direct transition")
+        button_layout.addWidget(self.remove_btn)
+
+        button_layout.addStretch()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        button_layout.addWidget(buttons)
+
+        layout.addLayout(button_layout)
+
+        self._removed = False
+        self.remove_btn.clicked.connect(self._on_remove)
+        self.method_combo.currentIndexChanged.connect(self._update_status)
+        self._update_status()
+
+    def _update_status(self) -> None:
+        """Update the status label and setup button based on current method."""
+        method = self.method_combo.currentData()
+
+        rife_ready = PracticalRifeEnv.is_setup()
+        film_ready = FilmEnv.is_setup() if rife_ready else False
+
+        if method == DirectInterpolationMethod.RIFE:
+            if rife_ready:
+                self.status_label.setText("RIFE: Ready")
+                self.status_label.setStyleSheet("color: green; font-size: 10px;")
+                self.setup_btn.setVisible(False)
+            else:
+                self.status_label.setText("RIFE: Not installed (PyTorch required)")
+                self.status_label.setStyleSheet("color: orange; font-size: 10px;")
+                self.setup_btn.setVisible(True)
+                self.setup_btn.setText("Setup PyTorch Environment")
+        else:  # FILM
+            if film_ready:
+                self.status_label.setText("FILM: Ready")
+                self.status_label.setStyleSheet("color: green; font-size: 10px;")
+                self.setup_btn.setVisible(False)
+            elif rife_ready:
+                self.status_label.setText("FILM: Package not installed")
+                self.status_label.setStyleSheet("color: orange; font-size: 10px;")
+                self.setup_btn.setVisible(True)
+                self.setup_btn.setText("Install FILM Package")
+            else:
+                self.status_label.setText("FILM: Not installed (PyTorch required first)")
+                self.status_label.setStyleSheet("color: orange; font-size: 10px;")
+                self.setup_btn.setVisible(True)
+                self.setup_btn.setText("Setup PyTorch Environment")
+
+    def _on_setup(self) -> None:
+        """Handle setup button click."""
+        method = self.method_combo.currentData()
+        rife_ready = PracticalRifeEnv.is_setup()
+
+        if not rife_ready:
+            # Need to set up PyTorch venv first
+            progress = QProgressDialog(
+                "Setting up PyTorch environment...", "Cancel", 0, 100, self
+            )
+            progress.setWindowTitle("Setup")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+
+            cancelled = [False]
+
+            def progress_cb(msg, pct):
+                progress.setLabelText(msg)
+                progress.setValue(pct)
+
+            def cancelled_check():
+                QApplication.processEvents()
+                return progress.wasCanceled()
+
+            success = PracticalRifeEnv.setup_venv(progress_cb, cancelled_check)
+            progress.close()
+
+            if not success:
+                if not cancelled_check():
+                    QMessageBox.warning(
+                        self, "Setup Failed",
+                        "Failed to set up PyTorch environment."
+                    )
+                return
+
+        # If FILM selected and we need to install FILM package
+        if method == DirectInterpolationMethod.FILM and not FilmEnv.is_setup():
+            progress = QProgressDialog(
+                "Installing FILM package...", "Cancel", 0, 100, self
+            )
+            progress.setWindowTitle("Setup")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+
+            def progress_cb(msg, pct):
+                progress.setLabelText(msg)
+                progress.setValue(pct)
+
+            def cancelled_check():
+                QApplication.processEvents()
+                return progress.wasCanceled()
+
+            success = FilmEnv.setup_film(progress_cb, cancelled_check)
+            progress.close()
+
+            if not success:
+                if not cancelled_check():
+                    QMessageBox.warning(
+                        self, "Setup Failed",
+                        "Failed to install FILM package."
+                    )
+                return
+
+        self._update_status()
+
+    def _on_remove(self) -> None:
+        """Handle remove button click."""
+        self._removed = True
+        self.reject()
+
+    def was_removed(self) -> bool:
+        """Check if the user clicked Remove."""
+        return self._removed
+
+    def get_values(self) -> tuple[DirectInterpolationMethod, int, bool]:
+        """Get the dialog values."""
+        return (
+            self.method_combo.currentData(),
+            self.frame_spin.value(),
+            self.enabled_check.isChecked()
+        )
+
+
 class SequenceLinkerUI(QWidget):
     """PyQt6 GUI for the Video Montage Linker."""
 
@@ -210,6 +423,7 @@ class SequenceLinkerUI(QWidget):
         self._folder_type_overrides: dict[Path, FolderType] = {}
         self._transition_settings = TransitionSettings()
         self._per_transition_settings: dict[Path, PerTransitionSettings] = {}
+        self._direct_transitions: dict[Path, DirectTransitionSettings] = {}
         self._current_session_id: Optional[int] = None
         self.db = DatabaseManager()
         self.manager = SymlinkManager(self.db)
@@ -831,6 +1045,8 @@ class SequenceLinkerUI(QWidget):
 
         # Sequence table selection - show image
         self.sequence_table.currentItemChanged.connect(self._on_sequence_table_selected)
+        # Also handle clicks on non-selectable items (direct interpolation rows)
+        self.sequence_table.itemClicked.connect(self._on_sequence_table_clicked)
 
         # Update sequence table when transitions setting changes
         self.transition_group.toggled.connect(self._update_sequence_table)
@@ -1276,6 +1492,18 @@ class SequenceLinkerUI(QWidget):
             trans_at_main_end[trans.main_folder] = trans
             trans_at_trans_start[trans.trans_folder] = trans
 
+        # Find consecutive MAIN folders (for direct interpolation)
+        consecutive_main_pairs: list[tuple[int, int]] = []
+        for i in range(len(self.source_folders) - 1):
+            folder_a = self.source_folders[i]
+            folder_b = self.source_folders[i + 1]
+            type_a = self._get_effective_folder_type(i, folder_a)
+            type_b = self._get_effective_folder_type(i + 1, folder_b)
+            # Two consecutive MAIN folders with no transition between them
+            if type_a == FolderType.MAIN and type_b == FolderType.MAIN:
+                if folder_a not in trans_at_main_end:
+                    consecutive_main_pairs.append((i, i + 1))
+
         # Process each folder
         for folder_idx, folder in enumerate(self.source_folders):
             folder_files = files_by_folder.get(folder, [])
@@ -1339,8 +1567,55 @@ class SequenceLinkerUI(QWidget):
 
                 self.sequence_table.addTopLevelItem(item)
 
+            # Check if this folder starts a direct interpolation gap
+            # (current MAIN followed by another MAIN with no transition)
+            for pair_idx_a, pair_idx_b in consecutive_main_pairs:
+                if folder_idx == pair_idx_a:
+                    # Add direct interpolation row after this folder's files
+                    self._add_direct_interpolation_row(folder, pair_idx_b)
+
         # Update timeline display after rebuilding sequence table
         self._update_timeline_display()
+
+    def _add_direct_interpolation_row(self, after_folder: Path, next_folder_idx: int) -> None:
+        """Add a clickable direct interpolation row between MAIN sequences.
+
+        Args:
+            after_folder: The folder after which interpolation occurs.
+            next_folder_idx: Index of the next MAIN folder.
+        """
+        direct_settings = self._direct_transitions.get(after_folder)
+
+        if direct_settings and direct_settings.enabled:
+            # Configured: show green row with settings + placeholder frames
+            method_name = direct_settings.method.value.upper()
+            frame_count = direct_settings.frame_count
+
+            # Header row (clickable to edit)
+            header_text = f"  [{method_name}: {frame_count} frames] (click to edit)"
+            header_item = QTreeWidgetItem([header_text, ""])
+            header_item.setData(0, Qt.ItemDataRole.UserRole, ('direct_header', after_folder))
+            header_item.setForeground(0, QColor(50, 180, 100))  # Green
+            header_item.setFlags(header_item.flags() & ~Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            self.sequence_table.addTopLevelItem(header_item)
+
+            # Add placeholder rows for each interpolated frame
+            for i in range(frame_count):
+                placeholder_text = f"    [{method_name} {i + 1}/{frame_count}]"
+                placeholder_item = QTreeWidgetItem([placeholder_text, ""])
+                placeholder_item.setData(0, Qt.ItemDataRole.UserRole, ('direct_placeholder', after_folder, i))
+                placeholder_item.setForeground(0, QColor(100, 180, 220))  # Light blue
+                # Make placeholders non-selectable
+                placeholder_item.setFlags(placeholder_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                self.sequence_table.addTopLevelItem(placeholder_item)
+        else:
+            # Unconfigured: show grey "+" row
+            add_text = "  [+ Add RIFE/FILM transition] (click to configure)"
+            add_item = QTreeWidgetItem([add_text, ""])
+            add_item.setData(0, Qt.ItemDataRole.UserRole, ('direct_add', after_folder))
+            add_item.setForeground(0, QColor(150, 150, 150))  # Grey
+            add_item.setFlags(add_item.flags() & ~Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            self.sequence_table.addTopLevelItem(add_item)
 
     def _on_sequence_table_selected(self, current, previous) -> None:
         """Handle sequence table row selection - show image in preview."""
@@ -1354,6 +1629,25 @@ class SequenceLinkerUI(QWidget):
         data = data0 if data0 else data1
         if not data:
             return
+
+        # Handle direct interpolation rows
+        if isinstance(data, tuple) and len(data) >= 2:
+            if data[0] == 'direct_add':
+                # "+" row - only open dialog if not playing (skip during playback)
+                if not self.sequence_playing:
+                    self._show_direct_transition_dialog(data[1])
+                return
+            elif data[0] == 'direct_header':
+                # Header row - only open dialog if not playing (skip during playback)
+                if not self.sequence_playing:
+                    self._show_direct_transition_dialog(data[1])
+                return
+            elif data[0] == 'direct_placeholder':
+                # Show preview of interpolated frame
+                after_folder = data[1]
+                frame_index = data[2]
+                self._show_direct_interpolation_preview(after_folder, frame_index)
+                return
 
         frame_type = data[4] if len(data) > 4 else 'symlink'
 
@@ -1388,6 +1682,29 @@ class SequenceLinkerUI(QWidget):
 
             seq_name = f"seq{data[2] + 1:02d}_{data[3]:04d}"
             self.image_name_label.setText(f"{seq_name} ({filename})")
+
+    def _on_sequence_table_clicked(self, item, column: int) -> None:
+        """Handle clicks on sequence table items, including non-selectable ones."""
+        if item is None:
+            return
+
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+
+        # Handle direct interpolation rows
+        if isinstance(data, tuple) and len(data) >= 2:
+            if data[0] == 'direct_add':
+                # Clicked on "+" row to add direct transition
+                self._show_direct_transition_dialog(data[1])
+            elif data[0] == 'direct_header':
+                # Clicked on configured direct transition header
+                self._show_direct_transition_dialog(data[1])
+            elif data[0] == 'direct_placeholder':
+                # Clicked on placeholder row - show preview of interpolated frame
+                after_folder = data[1]
+                frame_index = data[2]
+                self._show_direct_interpolation_preview(after_folder, frame_index)
 
     def _show_blend_preview(self, item, data0, data1) -> None:
         """Show a cross-dissolve preview for a blend frame."""
@@ -1516,6 +1833,267 @@ class SequenceLinkerUI(QWidget):
             self.image_name_label.setText("")
             self._current_pixmap = None
 
+    def _show_direct_interpolation_preview(self, after_folder: Path, frame_index: int) -> None:
+        """Generate and show a preview for a direct interpolation placeholder frame.
+
+        For RIFE: Generates one frame at a time (RIFE handles arbitrary timesteps well).
+        For FILM: Generates ALL frames at once on first click (FILM works best this way),
+                  then caches all frames for instant subsequent access.
+
+        Args:
+            after_folder: The folder after which the interpolation occurs.
+            frame_index: The index of the interpolated frame (0-based).
+        """
+        from PIL import Image
+        from PIL.ImageQt import ImageQt
+        from core import ImageBlender
+
+        # Get direct transition settings
+        direct_settings = self._direct_transitions.get(after_folder)
+        if not direct_settings or not direct_settings.enabled:
+            self.image_label.setText("Direct interpolation not configured")
+            self.image_name_label.setText("")
+            self._current_pixmap = None
+            return
+
+        # Find the folder index and next folder
+        try:
+            folder_idx = self.source_folders.index(after_folder)
+        except ValueError:
+            self.image_label.setText("Folder not found in sequence")
+            self.image_name_label.setText("")
+            self._current_pixmap = None
+            return
+
+        if folder_idx >= len(self.source_folders) - 1:
+            self.image_label.setText("No next folder for interpolation")
+            self.image_name_label.setText("")
+            self._current_pixmap = None
+            return
+
+        next_folder = self.source_folders[folder_idx + 1]
+
+        # Get files for both folders
+        files = self._get_files_in_order()
+        files_by_folder: dict[Path, list[str]] = {}
+        for source_dir, filename, f_idx, file_idx in files:
+            if source_dir not in files_by_folder:
+                files_by_folder[source_dir] = []
+            files_by_folder[source_dir].append(filename)
+
+        after_files = files_by_folder.get(after_folder, [])
+        next_files = files_by_folder.get(next_folder, [])
+
+        if not after_files or not next_files:
+            self.image_label.setText("Missing frames for interpolation")
+            self.image_name_label.setText("")
+            self._current_pixmap = None
+            return
+
+        # Get last frame of after_folder and first frame of next_folder
+        last_frame_path = after_folder / after_files[-1]
+        first_frame_path = next_folder / next_files[0]
+
+        if not last_frame_path.exists() or not first_frame_path.exists():
+            self.image_label.setText(f"Frame files not found")
+            self.image_name_label.setText("")
+            self._current_pixmap = None
+            return
+
+        # Calculate timestep
+        frame_count = direct_settings.frame_count
+        t = (frame_index + 1) / (frame_count + 1)  # Evenly spaced between 0 and 1
+
+        # Create cache key - include frame_count so changing count invalidates cache
+        cache_key = f"direct|{after_folder}|{frame_index}|{direct_settings.method.value}|{frame_count}"
+
+        try:
+            # Check cache first
+            if cache_key in self._blend_preview_cache:
+                pixmap = self._blend_preview_cache[cache_key]
+            elif direct_settings.method == DirectInterpolationMethod.FILM and FilmEnv.is_setup():
+                # FILM: Generate ALL frames at once for better quality
+                # Check if we need to generate (first frame not cached means none are)
+                first_cache_key = f"direct|{after_folder}|0|{direct_settings.method.value}|{frame_count}"
+                if first_cache_key not in self._blend_preview_cache:
+                    # Generate all frames at once
+                    error_msg = self._generate_all_film_preview_frames(
+                        after_folder, last_frame_path, first_frame_path, frame_count
+                    )
+                    if error_msg:
+                        # Error already displayed in image_label by the method
+                        self._current_pixmap = None
+                        return
+
+                # Now retrieve the specific frame from cache
+                if cache_key in self._blend_preview_cache:
+                    pixmap = self._blend_preview_cache[cache_key]
+                else:
+                    # Fallback if batch generation failed
+                    self.image_label.setText("FILM batch generation failed - check console for details")
+                    self.image_name_label.setText("")
+                    self._current_pixmap = None
+                    return
+            else:
+                # RIFE (or FILM not set up): Generate one frame at a time
+                # Load images
+                img_a = Image.open(last_frame_path)
+                img_b = Image.open(first_frame_path)
+
+                # Resize B to match A if needed
+                if img_a.size != img_b.size:
+                    img_b = img_b.resize(img_a.size, Image.Resampling.LANCZOS)
+
+                # Convert to RGBA
+                if img_a.mode != 'RGBA':
+                    img_a = img_a.convert('RGBA')
+                if img_b.mode != 'RGBA':
+                    img_b = img_b.convert('RGBA')
+
+                # Generate interpolated frame
+                if direct_settings.method == DirectInterpolationMethod.FILM:
+                    # FILM not set up, use fallback
+                    blended = ImageBlender.film_blend(img_a, img_b, t)
+                else:  # RIFE
+                    settings = self._get_transition_settings()
+                    blended = ImageBlender.practical_rife_blend(
+                        img_a, img_b, t,
+                        settings.practical_rife_model,
+                        settings.practical_rife_ensemble
+                    )
+
+                # Convert to QPixmap
+                qim = ImageQt(blended.convert('RGBA'))
+                pixmap = QPixmap.fromImage(qim)
+
+                # Store in cache
+                self._blend_preview_cache[cache_key] = pixmap
+
+                img_a.close()
+                img_b.close()
+
+            self._current_pixmap = pixmap
+            self._apply_zoom()
+
+            # Update labels
+            method_name = direct_settings.method.value.upper()
+            self.image_name_label.setText(
+                f"[{method_name} {frame_index + 1}/{frame_count}] @ t={t:.2f}"
+            )
+
+            # Find the item index in the table for image_index_label
+            for i in range(self.sequence_table.topLevelItemCount()):
+                item = self.sequence_table.topLevelItem(i)
+                item_data = item.data(0, Qt.ItemDataRole.UserRole)
+                if (isinstance(item_data, tuple) and len(item_data) >= 3 and
+                    item_data[0] == 'direct_placeholder' and
+                    item_data[1] == after_folder and
+                    item_data[2] == frame_index):
+                    total = self.sequence_table.topLevelItemCount()
+                    self.image_index_label.setText(f"{i + 1} / {total}")
+                    break
+
+        except Exception as e:
+            self.image_label.setText(f"Error generating interpolation preview:\n{e}")
+            self.image_name_label.setText("")
+            self._current_pixmap = None
+
+    def _generate_all_film_preview_frames(
+        self,
+        after_folder: Path,
+        last_frame_path: Path,
+        first_frame_path: Path,
+        frame_count: int
+    ) -> Optional[str]:
+        """Generate all FILM preview frames at once and cache them.
+
+        FILM works best when generating all frames at once using its
+        recursive approach. This method generates all frames and stores
+        them in the preview cache.
+
+        Args:
+            after_folder: The folder after which the interpolation occurs.
+            last_frame_path: Path to the last frame of the current sequence.
+            first_frame_path: Path to the first frame of the next sequence.
+            frame_count: Number of frames to generate.
+
+        Returns:
+            None on success, error message string on failure.
+        """
+        from PIL import Image
+        from PIL.ImageQt import ImageQt
+        import tempfile
+
+        # Show progress dialog
+        progress = QProgressDialog(
+            f"Generating {frame_count} FILM frames...", "Cancel", 0, 100, self
+        )
+        progress.setWindowTitle("FILM Interpolation")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(10)
+        QApplication.processEvents()
+
+        try:
+            # Use a temp directory for FILM batch output
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_path = Path(tmpdir)
+
+                progress.setLabelText("Running FILM batch interpolation...")
+                progress.setValue(20)
+                QApplication.processEvents()
+
+                # Run batch interpolation
+                success, error, output_paths = FilmEnv.run_batch_interpolation(
+                    last_frame_path,
+                    first_frame_path,
+                    tmp_path,
+                    frame_count,
+                    'frame_{:04d}.png'
+                )
+
+                if not success:
+                    progress.close()
+                    error_msg = f"FILM error: {error}"
+                    self.image_label.setText(error_msg)
+                    self.image_name_label.setText("")
+                    return error_msg
+
+                progress.setLabelText("Loading generated frames...")
+                progress.setValue(70)
+                QApplication.processEvents()
+
+                # Load all frames and cache them
+                for i, output_path in enumerate(output_paths):
+                    if progress.wasCanceled():
+                        break
+
+                    if output_path.exists():
+                        frame = Image.open(output_path)
+                        qim = ImageQt(frame.convert('RGBA'))
+                        pixmap = QPixmap.fromImage(qim)
+
+                        # Cache with the standard key format (include frame_count)
+                        cache_key = f"direct|{after_folder}|{i}|film|{frame_count}"
+                        self._blend_preview_cache[cache_key] = pixmap
+
+                        frame.close()
+
+                    # Update progress
+                    pct = 70 + int(30 * (i + 1) / frame_count)
+                    progress.setValue(pct)
+                    QApplication.processEvents()
+
+            progress.close()
+            return None  # Success
+
+        except Exception as e:
+            progress.close()
+            error_msg = f"FILM batch error: {e}"
+            self.image_label.setText(error_msg)
+            self.image_name_label.setText("")
+            return error_msg
+
     def _update_timeline_display(self) -> None:
         """Update the timeline duration display based on frame count and FPS."""
         frame_count = self.sequence_table.topLevelItemCount()
@@ -1575,12 +2153,21 @@ class SequenceLinkerUI(QWidget):
         current_idx = self.sequence_table.indexOfTopLevelItem(current_item)
         total = self.sequence_table.topLevelItemCount()
 
-        if current_idx < total - 1:
-            next_item = self.sequence_table.topLevelItem(current_idx + 1)
+        # Find next valid frame (skip direct_add and direct_header rows)
+        next_idx = current_idx + 1
+        while next_idx < total:
+            next_item = self.sequence_table.topLevelItem(next_idx)
+            data = next_item.data(0, Qt.ItemDataRole.UserRole)
+            # Skip non-frame rows (direct_add, direct_header)
+            if isinstance(data, tuple) and len(data) >= 1 and data[0] in ('direct_add', 'direct_header'):
+                next_idx += 1
+                continue
+            # Found a valid frame
             self.sequence_table.setCurrentItem(next_item)
-        else:
-            # Reached end - stop playback
-            self._stop_sequence_play()
+            return
+
+        # Reached end - stop playback
+        self._stop_sequence_play()
 
     def _browse_trans_destination(self) -> None:
         """Select transition destination folder via file dialog."""
@@ -1728,7 +2315,7 @@ class SequenceLinkerUI(QWidget):
                 return
 
     def _remove_source_folder(self) -> None:
-        """Remove selected source folder(s)."""
+        """Remove selected source folder(s), preserving sequence order of remaining files."""
         result = self._get_selected_folder()
         if result is None:
             return
@@ -1739,12 +2326,71 @@ class SequenceLinkerUI(QWidget):
             del self._folder_type_overrides[folder]
         if folder in self._per_transition_settings:
             del self._per_transition_settings[folder]
+        if folder in self._folder_trim_settings:
+            del self._folder_trim_settings[folder]
+        if folder in self._folder_file_counts:
+            del self._folder_file_counts[folder]
 
         del self.source_folders[idx]
 
         self._sync_dual_lists()
-        self._refresh_files()
+
+        # Remove only files from the deleted folder, preserving order of others
+        self._remove_files_from_folder(folder)
+
+        # Renumber sequence names to reflect new folder indices
+        self._recalculate_sequence_names()
+
+        # Update the sequence table (With Transitions tab)
+        self._update_sequence_table()
+
         self._update_flow_arrows()
+
+    def _remove_files_from_folder(self, folder: Path) -> None:
+        """Remove all files from a specific folder without affecting order of other files."""
+        folder_str = str(folder)
+        rows_to_remove = []
+
+        for i in range(self.file_list.topLevelItemCount()):
+            item = self.file_list.topLevelItem(i)
+            if item and item.text(2) == folder_str:
+                rows_to_remove.append(i)
+
+        # Remove in reverse order to preserve indices
+        for row in reversed(rows_to_remove):
+            self.file_list.takeTopLevelItem(row)
+
+        # Clean up separators (remove consecutive or leading/trailing separators)
+        self._cleanup_separators()
+
+        # Update slider range
+        total = self.file_list.topLevelItemCount()
+        self.image_slider.setRange(0, max(0, total - 1))
+
+    def _cleanup_separators(self) -> None:
+        """Remove unnecessary separators (consecutive, leading, or trailing)."""
+        rows_to_remove = []
+        prev_was_separator = True  # Treat start as "separator" to remove leading ones
+
+        for i in range(self.file_list.topLevelItemCount()):
+            item = self.file_list.topLevelItem(i)
+            is_separator = self._is_separator_item(item)
+
+            if is_separator and prev_was_separator:
+                rows_to_remove.append(i)
+            prev_was_separator = is_separator
+
+        # Check if last item is a separator
+        if self.file_list.topLevelItemCount() > 0:
+            last_item = self.file_list.topLevelItem(self.file_list.topLevelItemCount() - 1)
+            if self._is_separator_item(last_item):
+                last_idx = self.file_list.topLevelItemCount() - 1
+                if last_idx not in rows_to_remove:
+                    rows_to_remove.append(last_idx)
+
+        # Remove in reverse order
+        for row in sorted(rows_to_remove, reverse=True):
+            self.file_list.takeTopLevelItem(row)
 
     def _remove_selected_files(self) -> None:
         """Remove selected files from the file list."""
@@ -1755,6 +2401,9 @@ class SequenceLinkerUI(QWidget):
         rows = sorted([self.file_list.indexOfTopLevelItem(item) for item in selected], reverse=True)
         for row in rows:
             self.file_list.takeTopLevelItem(row)
+
+        # Update the With Transitions tab to reflect the removal
+        self._update_sequence_table()
 
     def _get_path_history_file(self) -> Path:
         """Get the path to the history JSON file."""
@@ -2154,6 +2803,38 @@ class SequenceLinkerUI(QWidget):
             self._sync_dual_lists()
             self._update_sequence_table()
 
+    def _show_direct_transition_dialog(self, after_folder: Path) -> None:
+        """Show dialog to configure direct frame interpolation between sequences."""
+        existing = self._direct_transitions.get(after_folder)
+        if existing:
+            frame_count = existing.frame_count
+            method = existing.method
+            enabled = existing.enabled
+        else:
+            frame_count = 16
+            method = DirectInterpolationMethod.FILM
+            enabled = True
+
+        dialog = DirectTransitionDialog(
+            self, after_folder.name, frame_count, method, enabled
+        )
+        result = dialog.exec()
+
+        if dialog.was_removed():
+            # User clicked Remove
+            if after_folder in self._direct_transitions:
+                del self._direct_transitions[after_folder]
+            self._update_sequence_table()
+        elif result == QDialog.DialogCode.Accepted:
+            new_method, new_count, new_enabled = dialog.get_values()
+            self._direct_transitions[after_folder] = DirectTransitionSettings(
+                after_folder=after_folder,
+                frame_count=new_count,
+                method=new_method,
+                enabled=new_enabled
+            )
+            self._update_sequence_table()
+
     def _set_folder_type(self, folder: Path, folder_type: FolderType) -> None:
         """Set the folder type override for a folder."""
         if folder_type == FolderType.AUTO:
@@ -2223,6 +2904,7 @@ class SequenceLinkerUI(QWidget):
         self._folder_file_counts = {folder: len(files) for folder, files in files_by_folder.items()}
 
         folder_file_counts: dict[Path, int] = {}
+        is_first_folder = True
         for folder in self.source_folders:
             if folder not in files_by_folder:
                 continue
@@ -2237,7 +2919,16 @@ class SequenceLinkerUI(QWidget):
             end_idx = total_in_folder - trim_end
             trimmed_files = folder_files[trim_start:end_idx]
 
+            if not trimmed_files:
+                continue
+
             folder_idx = folder_to_index.get(folder, 0)
+
+            # Add separator between folders (not before first)
+            if not is_first_folder:
+                separator = self._create_folder_separator(folder_idx)
+                self.file_list.addTopLevelItem(separator)
+            is_first_folder = False
 
             for filename in trimmed_files:
                 file_idx = folder_file_counts.get(folder, 0)
@@ -2261,6 +2952,22 @@ class SequenceLinkerUI(QWidget):
         self._update_trim_slider_for_selected_folder()
         self._update_sequence_table()
 
+    def _create_folder_separator(self, next_folder_idx: int) -> QTreeWidgetItem:
+        """Create a visual separator item between folders."""
+        separator = QTreeWidgetItem(["", f"── Sequence {next_folder_idx + 1} ──", ""])
+        separator.setData(0, Qt.ItemDataRole.UserRole, None)  # No data = separator
+        # Light grey background
+        grey = QColor(220, 220, 220)
+        for col in range(3):
+            separator.setBackground(col, grey)
+        # Make it non-selectable and non-draggable
+        separator.setFlags(Qt.ItemFlag.NoItemFlags)
+        return separator
+
+    def _is_separator_item(self, item: QTreeWidgetItem) -> bool:
+        """Check if an item is a folder separator."""
+        return item.data(0, Qt.ItemDataRole.UserRole) is None
+
     def _get_files_in_order(self) -> list[tuple[Path, str, int, int]]:
         """Get files in the current list order with sequence info."""
         files = []
@@ -2278,6 +2985,7 @@ class SequenceLinkerUI(QWidget):
 
         folder_to_index = {folder: i for i, folder in enumerate(self.source_folders)}
         folder_file_counts: dict[Path, int] = {}
+        last_folder_idx = -1
 
         for i in range(self.file_list.topLevelItemCount()):
             item = self.file_list.topLevelItem(i)
@@ -2293,6 +3001,21 @@ class SequenceLinkerUI(QWidget):
                 seq_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
                 item.setText(0, seq_name)
                 item.setData(0, Qt.ItemDataRole.UserRole, (source_dir, filename, folder_idx, file_idx))
+                last_folder_idx = folder_idx
+            elif self._is_separator_item(item):
+                # Update separator label based on next file's folder
+                # Look ahead to find the next file's folder index
+                next_folder_idx = last_folder_idx + 1
+                for j in range(i + 1, self.file_list.topLevelItemCount()):
+                    next_item = self.file_list.topLevelItem(j)
+                    next_data = next_item.data(0, Qt.ItemDataRole.UserRole)
+                    if next_data:
+                        next_folder_idx = folder_to_index.get(next_data[0], last_folder_idx + 1)
+                        break
+                item.setText(1, f"── Sequence {next_folder_idx + 1} ──")
+
+        # Update the With Transitions tab to reflect the new order
+        self._update_sequence_table()
 
     # --- Video Preview Methods ---
 
@@ -2773,7 +3496,12 @@ class SequenceLinkerUI(QWidget):
             trans_at_main_end[trans.main_folder] = trans
             trans_at_trans_start[trans.trans_folder] = trans
 
+        # Count total files including direct interpolation frames
         total_files = sum(len(f) for f in files_by_folder.values())
+        for folder, direct_settings in self._direct_transitions.items():
+            if direct_settings.enabled:
+                total_files += direct_settings.frame_count
+
         progress = QProgressDialog("Generating sequence...", "Cancel", 0, total_files, self)
         progress.setWindowTitle("Cross-Dissolve Generation")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -2891,6 +3619,55 @@ class SequenceLinkerUI(QWidget):
 
                 current_op += 1
                 progress.setValue(current_op)
+
+            # Check for direct interpolation after this folder
+            if folder in self._direct_transitions:
+                direct_settings = self._direct_transitions[folder]
+                if direct_settings.enabled:
+                    # Find next folder and get its first frame
+                    next_folder_idx = folder_idx + 1
+                    if next_folder_idx < len(self.source_folders):
+                        next_folder = self.source_folders[next_folder_idx]
+                        next_files = files_by_folder.get(next_folder, [])
+                        if next_files and folder_files:
+                            # Get last frame of current folder and first of next
+                            last_frame = folder / folder_files[-1]
+                            first_frame = next_folder / next_files[0]
+
+                            progress.setLabelText(
+                                f"Generating {direct_settings.method.value.upper()} frames..."
+                            )
+
+                            # Generate direct interpolation frames
+                            direct_results = generator.generate_direct_interpolation_frames(
+                                last_frame,
+                                first_frame,
+                                direct_settings.frame_count,
+                                direct_settings.method,
+                                trans_dest,
+                                folder_idx,
+                                output_seq,
+                                settings.practical_rife_model,
+                                settings.practical_rife_ensemble
+                            )
+
+                            for result in direct_results:
+                                if result.success:
+                                    blend_count += 1
+                                    self.db.record_symlink(
+                                        session_id,
+                                        str(result.source_a.resolve()),
+                                        str(result.output_path),
+                                        result.output_path.name,
+                                        output_seq
+                                    )
+                                else:
+                                    errors.append(
+                                        f"Direct interp {result.output_path.name}: {result.error}"
+                                    )
+                                output_seq += 1
+
+                            progress.setLabelText("Generating sequence...")
 
         progress.close()
 

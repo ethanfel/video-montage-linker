@@ -23,6 +23,8 @@ from .models import (
     PerTransitionSettings,
     BlendResult,
     TransitionSpec,
+    DirectInterpolationMethod,
+    DirectTransitionSettings,
 )
 
 
@@ -249,6 +251,230 @@ class PracticalRifeEnv:
             return False, "timeout (120s)"
         except Exception as e:
             return False, str(e)
+
+
+class FilmEnv:
+    """Manages FILM frame interpolation using shared venv with RIFE."""
+
+    VENV_DIR = PRACTICAL_RIFE_VENV_DIR  # Share venv with RIFE
+    MODEL_CACHE_DIR = CACHE_DIR / 'film'
+    MODEL_FILENAME = 'film_net_fp32.pt'
+    MODEL_URL = 'https://github.com/dajes/frame-interpolation-pytorch/releases/download/v1.0.2/film_net_fp32.pt'
+
+    # Keep REPO_DIR for backward compat (but unused now - model is downloaded directly)
+    REPO_DIR = CACHE_DIR / 'frame-interpolation-pytorch'
+
+    @classmethod
+    def get_venv_python(cls) -> Optional[Path]:
+        """Get path to venv Python executable."""
+        if cls.VENV_DIR.exists():
+            if sys.platform == 'win32':
+                return cls.VENV_DIR / 'Scripts' / 'python.exe'
+            return cls.VENV_DIR / 'bin' / 'python'
+        return None
+
+    @classmethod
+    def get_model_path(cls) -> Path:
+        """Get path to the FILM TorchScript model."""
+        return cls.MODEL_CACHE_DIR / cls.MODEL_FILENAME
+
+    @classmethod
+    def is_setup(cls) -> bool:
+        """Check if venv exists and FILM model is downloaded."""
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            return False
+        # Check if model is downloaded
+        return cls.get_model_path().exists()
+
+    @classmethod
+    def setup_film(cls, progress_callback=None, cancelled_check=None) -> bool:
+        """Download FILM model and ensure venv is ready.
+
+        Args:
+            progress_callback: Optional callback(message, percent) for progress.
+            cancelled_check: Optional callable that returns True if cancelled.
+
+        Returns:
+            True if setup was successful.
+        """
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            # Need to set up base venv first via PracticalRifeEnv
+            return False
+
+        try:
+            model_path = cls.get_model_path()
+
+            if not model_path.exists():
+                if progress_callback:
+                    progress_callback("Downloading FILM model (~380MB)...", 30)
+                if cancelled_check and cancelled_check():
+                    return False
+
+                # Download the pre-trained TorchScript model
+                cls.MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                urllib.request.urlretrieve(cls.MODEL_URL, model_path)
+
+            if progress_callback:
+                progress_callback("FILM setup complete!", 100)
+
+            return cls.is_setup()
+
+        except Exception as e:
+            print(f"[FILM] Setup error: {e}", file=sys.stderr)
+            return False
+
+    @classmethod
+    def get_worker_script(cls) -> Path:
+        """Get path to the FILM worker script."""
+        return Path(__file__).parent / 'film_worker.py'
+
+    @classmethod
+    def run_interpolation(
+        cls,
+        img_a_path: Path,
+        img_b_path: Path,
+        output_path: Path,
+        t: float
+    ) -> tuple[bool, str]:
+        """Run FILM interpolation via subprocess in venv.
+
+        Args:
+            img_a_path: Path to first input image.
+            img_b_path: Path to second input image.
+            output_path: Path to output image.
+            t: Timestep for interpolation (0.0 to 1.0).
+
+        Returns:
+            Tuple of (success, error_message).
+        """
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            return False, "venv python not found"
+
+        script = cls.get_worker_script()
+        if not script.exists():
+            return False, f"worker script not found: {script}"
+
+        cmd = [
+            str(python), str(script),
+            '--input0', str(img_a_path),
+            '--input1', str(img_b_path),
+            '--output', str(output_path),
+            '--timestep', str(t),
+            '--repo-dir', str(cls.REPO_DIR),
+            '--model-dir', str(cls.MODEL_CACHE_DIR)
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=180  # 3 minute timeout per frame (FILM is slower)
+            )
+            if result.returncode == 0 and output_path.exists():
+                return True, ""
+            else:
+                error = result.stderr.strip() if result.stderr else f"returncode={result.returncode}"
+                return False, error
+        except subprocess.TimeoutExpired:
+            return False, "timeout (180s)"
+        except Exception as e:
+            return False, str(e)
+
+    @classmethod
+    def run_batch_interpolation(
+        cls,
+        img_a_path: Path,
+        img_b_path: Path,
+        output_dir: Path,
+        frame_count: int,
+        output_pattern: str = 'frame_{:04d}.png'
+    ) -> tuple[bool, str, list[Path]]:
+        """Run FILM batch interpolation via subprocess in venv.
+
+        Generates all frames at once using FILM's recursive approach,
+        which produces better results than generating frames independently.
+
+        Args:
+            img_a_path: Path to first input image.
+            img_b_path: Path to second input image.
+            output_dir: Directory to save output frames.
+            frame_count: Number of frames to generate.
+            output_pattern: Filename pattern for output frames.
+
+        Returns:
+            Tuple of (success, error_message, list_of_output_paths).
+        """
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            return False, "venv python not found", []
+
+        script = cls.get_worker_script()
+        if not script.exists():
+            return False, f"worker script not found: {script}", []
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            str(python), str(script),
+            '--input0', str(img_a_path),
+            '--input1', str(img_b_path),
+            '--output-dir', str(output_dir),
+            '--frame-count', str(frame_count),
+            '--output-pattern', output_pattern,
+            '--repo-dir', str(cls.REPO_DIR),
+            '--model-dir', str(cls.MODEL_CACHE_DIR)
+        ]
+
+        try:
+            # Longer timeout for batch - scale with frame count
+            timeout = max(300, frame_count * 30)  # At least 5 min, +30s per frame
+
+            print(f"[FILM] Running batch interpolation: {frame_count} frames", file=sys.stderr)
+            print(f"[FILM] Command: {' '.join(cmd)}", file=sys.stderr)
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+
+            # Collect output paths
+            output_paths = [
+                output_dir / output_pattern.format(i)
+                for i in range(frame_count)
+            ]
+            existing_paths = [p for p in output_paths if p.exists()]
+
+            if result.returncode == 0 and len(existing_paths) == frame_count:
+                print(f"[FILM] Success: generated {len(existing_paths)} frames", file=sys.stderr)
+                return True, "", output_paths
+            else:
+                # Combine stdout and stderr for better error reporting
+                error_parts = []
+                if result.returncode != 0:
+                    error_parts.append(f"returncode={result.returncode}")
+                if result.stdout and result.stdout.strip():
+                    error_parts.append(f"stdout: {result.stdout.strip()}")
+                if result.stderr and result.stderr.strip():
+                    error_parts.append(f"stderr: {result.stderr.strip()}")
+                if len(existing_paths) != frame_count:
+                    error_parts.append(f"expected {frame_count} frames, got {len(existing_paths)}")
+
+                error = "; ".join(error_parts) if error_parts else "unknown error"
+                print(f"[FILM] Failed: {error}", file=sys.stderr)
+                return False, error, existing_paths
+
+        except subprocess.TimeoutExpired:
+            print(f"[FILM] Timeout after {timeout}s", file=sys.stderr)
+            return False, f"timeout ({timeout}s)", []
+        except Exception as e:
+            print(f"[FILM] Exception: {e}", file=sys.stderr)
+            return False, str(e), []
 
 
 class RifeDownloader:
@@ -825,6 +1051,56 @@ class ImageBlender:
         return ImageBlender.rife_blend(img_a, img_b, t)
 
     @staticmethod
+    def film_blend(
+        img_a: Image.Image,
+        img_b: Image.Image,
+        t: float
+    ) -> Image.Image:
+        """Blend using FILM for large motion interpolation.
+
+        FILM (Frame Interpolation for Large Motion) is Google Research's
+        high-quality frame interpolation model, better for large motion.
+
+        Args:
+            img_a: First PIL Image (source frame).
+            img_b: Second PIL Image (target frame).
+            t: Interpolation factor 0.0 (100% A) to 1.0 (100% B).
+
+        Returns:
+            AI-interpolated blended PIL Image.
+        """
+        if not FilmEnv.is_setup():
+            print("[FILM] Not set up, falling back to Practical-RIFE", file=sys.stderr)
+            return ImageBlender.practical_rife_blend(img_a, img_b, t)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                input_a = tmp / 'a.png'
+                input_b = tmp / 'b.png'
+                output_file = tmp / 'out.png'
+
+                # Save input images
+                img_a.convert('RGB').save(input_a)
+                img_b.convert('RGB').save(input_b)
+
+                # Run FILM via subprocess
+                success, error_msg = FilmEnv.run_interpolation(
+                    input_a, input_b, output_file, t
+                )
+
+                if success and output_file.exists():
+                    return Image.open(output_file).copy()
+                else:
+                    print(f"[FILM] Interpolation failed: {error_msg}, falling back to Practical-RIFE", file=sys.stderr)
+
+        except Exception as e:
+            print(f"[FILM] Exception: {e}, falling back to Practical-RIFE", file=sys.stderr)
+
+        # Fall back to Practical-RIFE
+        return ImageBlender.practical_rife_blend(img_a, img_b, t)
+
+    @staticmethod
     def blend_images(
         img_a_path: Path,
         img_b_path: Path,
@@ -1312,3 +1588,241 @@ class TransitionGenerator:
         return self.generate_asymmetric_blend_frames(
             spec, dest, folder_idx_main, base_file_idx
         )
+
+    def generate_direct_interpolation_frames(
+        self,
+        img_a_path: Path,
+        img_b_path: Path,
+        frame_count: int,
+        method: DirectInterpolationMethod,
+        dest: Path,
+        folder_idx: int,
+        base_file_idx: int,
+        practical_rife_model: str = 'v4.25',
+        practical_rife_ensemble: bool = False
+    ) -> list[BlendResult]:
+        """Generate AI-interpolated frames between two images.
+
+        Used for direct transitions between MAIN sequences without
+        a transition folder.
+
+        For FILM: Uses batch mode to generate all frames at once (better quality).
+        For RIFE: Generates frames one at a time (RIFE handles arbitrary timesteps well).
+
+        Args:
+            img_a_path: Path to last frame of first sequence.
+            img_b_path: Path to first frame of second sequence.
+            frame_count: Number of interpolated frames to generate.
+            method: Interpolation method (RIFE or FILM).
+            dest: Destination directory for generated frames.
+            folder_idx: Folder index for sequence naming.
+            base_file_idx: Starting file index for sequence naming.
+            practical_rife_model: Practical-RIFE model version.
+            practical_rife_ensemble: Enable Practical-RIFE ensemble mode.
+
+        Returns:
+            List of BlendResult objects.
+        """
+        results = []
+        dest.mkdir(parents=True, exist_ok=True)
+
+        # For FILM, use batch mode to generate all frames at once
+        if method == DirectInterpolationMethod.FILM and FilmEnv.is_setup():
+            return self._generate_film_frames_batch(
+                img_a_path, img_b_path, frame_count, dest, folder_idx, base_file_idx
+            )
+
+        # For RIFE (or FILM fallback), generate frames one at a time
+        # Load source images
+        img_a = Image.open(img_a_path)
+        img_b = Image.open(img_b_path)
+
+        # Handle different sizes - resize B to match A
+        if img_a.size != img_b.size:
+            img_b = img_b.resize(img_a.size, Image.Resampling.LANCZOS)
+
+        # Normalize to RGBA
+        if img_a.mode != 'RGBA':
+            img_a = img_a.convert('RGBA')
+        if img_b.mode != 'RGBA':
+            img_b = img_b.convert('RGBA')
+
+        for i in range(frame_count):
+            # Evenly space t values between 0 and 1 (exclusive)
+            t = (i + 1) / (frame_count + 1)
+
+            # Generate interpolated frame
+            if method == DirectInterpolationMethod.FILM:
+                blended = ImageBlender.film_blend(img_a, img_b, t)
+            else:  # RIFE
+                blended = ImageBlender.practical_rife_blend(
+                    img_a, img_b, t,
+                    practical_rife_model, practical_rife_ensemble
+                )
+
+            # Generate output filename
+            ext = f".{self.settings.output_format.lower()}"
+            file_idx = base_file_idx + i
+            output_name = f"seq{folder_idx + 1:02d}_trans_{file_idx:04d}{ext}"
+            output_path = dest / output_name
+
+            # Save the blended frame
+            try:
+                # Convert back to RGB if saving to JPEG
+                if self.settings.output_format.lower() in ('jpg', 'jpeg'):
+                    blended = blended.convert('RGB')
+
+                # Save with appropriate options
+                save_kwargs = {}
+                if self.settings.output_format.lower() in ('jpg', 'jpeg'):
+                    save_kwargs['quality'] = self.settings.output_quality
+                elif self.settings.output_format.lower() == 'webp':
+                    save_kwargs['lossless'] = True
+                    save_kwargs['method'] = self.settings.webp_method
+                elif self.settings.output_format.lower() == 'png':
+                    save_kwargs['compress_level'] = 6
+
+                blended.save(output_path, **save_kwargs)
+
+                results.append(BlendResult(
+                    output_path=output_path,
+                    source_a=img_a_path,
+                    source_b=img_b_path,
+                    blend_factor=t,
+                    success=True
+                ))
+            except Exception as e:
+                results.append(BlendResult(
+                    output_path=output_path,
+                    source_a=img_a_path,
+                    source_b=img_b_path,
+                    blend_factor=t,
+                    success=False,
+                    error=str(e)
+                ))
+
+        # Close loaded images
+        img_a.close()
+        img_b.close()
+
+        return results
+
+    def _generate_film_frames_batch(
+        self,
+        img_a_path: Path,
+        img_b_path: Path,
+        frame_count: int,
+        dest: Path,
+        folder_idx: int,
+        base_file_idx: int
+    ) -> list[BlendResult]:
+        """Generate FILM frames using batch mode for better quality.
+
+        FILM works best when generating all frames at once using its
+        recursive approach, rather than generating arbitrary timesteps.
+
+        Args:
+            img_a_path: Path to last frame of first sequence.
+            img_b_path: Path to first frame of second sequence.
+            frame_count: Number of interpolated frames to generate.
+            dest: Destination directory for generated frames.
+            folder_idx: Folder index for sequence naming.
+            base_file_idx: Starting file index for sequence naming.
+
+        Returns:
+            List of BlendResult objects.
+        """
+        results = []
+
+        # Generate frames using FILM batch mode
+        # Use a temp pattern, then rename to final names
+        temp_pattern = 'film_temp_{:04d}.png'
+
+        success, error, temp_paths = FilmEnv.run_batch_interpolation(
+            img_a_path,
+            img_b_path,
+            dest,
+            frame_count,
+            temp_pattern
+        )
+
+        if not success:
+            # Return error results for all frames
+            for i in range(frame_count):
+                t = (i + 1) / (frame_count + 1)
+                ext = f".{self.settings.output_format.lower()}"
+                file_idx = base_file_idx + i
+                output_name = f"seq{folder_idx + 1:02d}_trans_{file_idx:04d}{ext}"
+                output_path = dest / output_name
+
+                results.append(BlendResult(
+                    output_path=output_path,
+                    source_a=img_a_path,
+                    source_b=img_b_path,
+                    blend_factor=t,
+                    success=False,
+                    error=error
+                ))
+            return results
+
+        # Rename temp files to final names and convert format if needed
+        for i, temp_path in enumerate(temp_paths):
+            t = (i + 1) / (frame_count + 1)
+            ext = f".{self.settings.output_format.lower()}"
+            file_idx = base_file_idx + i
+            output_name = f"seq{folder_idx + 1:02d}_trans_{file_idx:04d}{ext}"
+            output_path = dest / output_name
+
+            try:
+                if temp_path.exists():
+                    # Load the temp frame
+                    frame = Image.open(temp_path)
+
+                    # Convert format if needed
+                    if self.settings.output_format.lower() in ('jpg', 'jpeg'):
+                        frame = frame.convert('RGB')
+
+                    # Save with appropriate options
+                    save_kwargs = {}
+                    if self.settings.output_format.lower() in ('jpg', 'jpeg'):
+                        save_kwargs['quality'] = self.settings.output_quality
+                    elif self.settings.output_format.lower() == 'webp':
+                        save_kwargs['lossless'] = True
+                        save_kwargs['method'] = self.settings.webp_method
+                    elif self.settings.output_format.lower() == 'png':
+                        save_kwargs['compress_level'] = 6
+
+                    frame.save(output_path, **save_kwargs)
+                    frame.close()
+
+                    # Remove temp file if different from output
+                    if temp_path != output_path:
+                        temp_path.unlink(missing_ok=True)
+
+                    results.append(BlendResult(
+                        output_path=output_path,
+                        source_a=img_a_path,
+                        source_b=img_b_path,
+                        blend_factor=t,
+                        success=True
+                    ))
+                else:
+                    results.append(BlendResult(
+                        output_path=output_path,
+                        source_a=img_a_path,
+                        source_b=img_b_path,
+                        blend_factor=t,
+                        success=False,
+                        error=f"Temp file not found: {temp_path}"
+                    ))
+            except Exception as e:
+                results.append(BlendResult(
+                    output_path=output_path,
+                    source_a=img_a_path,
+                    source_b=img_b_path,
+                    blend_factor=t,
+                    success=False,
+                    error=str(e)
+                ))
+
+        return results

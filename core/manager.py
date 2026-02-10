@@ -80,11 +80,12 @@ class SymlinkManager:
 
     @staticmethod
     def cleanup_old_links(directory: Path) -> int:
-        """Remove existing seq* symlinks from a directory.
+        """Remove existing seq* symlinks and temporary files from a directory.
 
-        Handles both old format (seq_0000) and new format (seq01_0000).
-        Also removes blended image files (not just symlinks) created by
-        cross-dissolve transitions.
+        Handles all naming formats:
+        - Old folder-indexed: seq01_0000.png
+        - Continuous: seq_00000.png
+        Also removes blended image files and film_temp_*.png temporaries.
 
         Args:
             directory: Directory to clean up.
@@ -96,18 +97,26 @@ class SymlinkManager:
             CleanupError: If cleanup fails.
         """
         removed = 0
-        seq_pattern = re.compile(r'^seq\d*_\d+\.(png|jpg|jpeg|webp)$', re.IGNORECASE)
+        seq_pattern = re.compile(
+            r'^seq\d*_\d+\.(png|jpg|jpeg|webp)$', re.IGNORECASE
+        )
+        temp_pattern = re.compile(
+            r'^film_temp_\d+\.png$', re.IGNORECASE
+        )
         try:
             for item in directory.iterdir():
-                # Match both old (seq_NNNN) and new (seqNN_NNNN) formats
+                should_remove = False
                 if item.name.startswith("seq"):
                     if item.is_symlink():
-                        item.unlink()
-                        removed += 1
+                        should_remove = True
                     elif item.is_file() and seq_pattern.match(item.name):
-                        # Also remove blended image files
-                        item.unlink()
-                        removed += 1
+                        should_remove = True
+                elif item.is_file() and temp_pattern.match(item.name):
+                    should_remove = True
+
+                if should_remove:
+                    item.unlink()
+                    removed += 1
         except OSError as e:
             raise CleanupError(f"Failed to clean up old links: {e}") from e
 
@@ -119,8 +128,9 @@ class SymlinkManager:
         dest: Path,
         files: list[tuple],
         trim_settings: Optional[dict[Path, tuple[int, int]]] = None,
+        copy_files: bool = False,
     ) -> tuple[list[LinkResult], Optional[int]]:
-        """Create sequenced symlinks from source files to destination.
+        """Create sequenced symlinks or copies from source files to destination.
 
         Args:
             sources: List of source directories (for validation).
@@ -129,6 +139,7 @@ class SymlinkManager:
                    - (source_dir, filename) for CLI mode (uses global sequence)
                    - (source_dir, filename, folder_idx, file_idx) for GUI mode
             trim_settings: Optional dict mapping folder paths to (trim_start, trim_end).
+            copy_files: If True, copy files instead of creating symlinks.
 
         Returns:
             Tuple of (list of LinkResult objects, session_id or None).
@@ -172,11 +183,13 @@ class SymlinkManager:
             link_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
             link_path = dest / link_name
 
-            # Calculate relative path from destination to source
-            rel_source = Path(os.path.relpath(source_path.resolve(), dest.resolve()))
-
             try:
-                link_path.symlink_to(rel_source)
+                if copy_files:
+                    import shutil
+                    shutil.copy2(source_path, link_path)
+                else:
+                    rel_source = Path(os.path.relpath(source_path.resolve(), dest.resolve()))
+                    link_path.symlink_to(rel_source)
 
                 if self.db and session_id:
                     self.db.record_symlink(

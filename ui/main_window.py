@@ -424,6 +424,7 @@ class SequenceLinkerUI(QWidget):
         self._transition_settings = TransitionSettings()
         self._per_transition_settings: dict[Path, PerTransitionSettings] = {}
         self._direct_transitions: dict[Path, DirectTransitionSettings] = {}
+        self._removed_files: dict[Path, set[str]] = {}
         self._current_session_id: Optional[int] = None
         self.db = DatabaseManager()
         self.manager = SymlinkManager(self.db)
@@ -510,6 +511,12 @@ class SequenceLinkerUI(QWidget):
         self.export_trans_btn.setStyleSheet(
             "background-color: #3498db; color: white; "
             "height: 40px; font-weight: bold;"
+        )
+
+        self.copy_files_check = QCheckBox("Copy files (instead of symlinks)")
+        self.copy_files_check.setToolTip(
+            "Copy actual files instead of creating symlinks.\n"
+            "Use this when the destination is accessed from Docker or a remote system."
         )
 
         # Preview tabs
@@ -944,6 +951,7 @@ class SequenceLinkerUI(QWidget):
 
         # Export buttons layout
         export_layout = QHBoxLayout()
+        export_layout.addWidget(self.copy_files_check)
         export_layout.addWidget(self.export_btn)
         export_layout.addWidget(self.export_trans_btn)
 
@@ -2407,6 +2415,16 @@ class SequenceLinkerUI(QWidget):
         if not selected:
             return
 
+        # Track removed files for persistence
+        for item in selected:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data:
+                folder = data[0]
+                filename = data[1]
+                if folder not in self._removed_files:
+                    self._removed_files[folder] = set()
+                self._removed_files[folder].add(filename)
+
         rows = sorted([self.file_list.indexOfTopLevelItem(item) for item in selected], reverse=True)
         for row in rows:
             self.file_list.takeTopLevelItem(row)
@@ -2536,6 +2554,7 @@ class SequenceLinkerUI(QWidget):
         db_folder_types = self.db.get_folder_type_overrides(latest_session.id)
         db_transition_settings = self.db.get_transition_settings(latest_session.id)
         db_per_trans_settings = self.db.get_all_per_transition_settings(latest_session.id)
+        db_removed_files = self.db.get_removed_files(latest_session.id)
 
         # Pattern for new continuous format: seq_00000
         continuous_pattern = re.compile(r'seq_(\d+)')
@@ -2595,6 +2614,7 @@ class SequenceLinkerUI(QWidget):
         self._folder_trim_settings.clear()
         self._folder_type_overrides.clear()
         self._per_transition_settings.clear()
+        self._removed_files.clear()
 
         for folder, (folder_idx, file_list) in sorted_folders:
             folder_path = Path(folder)
@@ -2607,6 +2627,8 @@ class SequenceLinkerUI(QWidget):
                     self._folder_type_overrides[folder_path] = db_folder_types[folder]
                 if folder in db_per_trans_settings:
                     self._per_transition_settings[folder_path] = db_per_trans_settings[folder]
+                if folder in db_removed_files:
+                    self._removed_files[folder_path] = db_removed_files[folder]
 
         if db_transition_settings:
             self.transition_group.setChecked(db_transition_settings.enabled)
@@ -2644,6 +2666,39 @@ class SequenceLinkerUI(QWidget):
             # Update visibility of RIFE path widgets
             self._on_blend_method_changed(self.blend_method_combo.currentIndex())
 
+        # Reconstruct removed files by comparing disk contents vs exported files
+        # This recovers edits from sessions before removed_files persistence was added
+        if not db_removed_files:
+            exported_by_folder: dict[str, set[str]] = {}
+            for folder_str, (_, file_list) in folder_data.items():
+                exported_by_folder[folder_str] = {fname for _, fname in file_list}
+
+            for folder_path in self.source_folders:
+                folder_str = str(folder_path)
+                if folder_str not in exported_by_folder:
+                    continue
+                exported_names = exported_by_folder[folder_str]
+                # Get all supported files on disk for this folder
+                disk_files = set()
+                from config import SUPPORTED_EXTENSIONS
+                for f in sorted(folder_path.iterdir()):
+                    if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS:
+                        disk_files.add(f.name)
+
+                # Apply trim to get the effective file list
+                trim_start, trim_end = self._folder_trim_settings.get(folder_path, (0, 0))
+                sorted_disk = sorted(disk_files)
+                if trim_start > 0 or trim_end > 0:
+                    end_idx = len(sorted_disk) - trim_end
+                    trimmed = set(sorted_disk[trim_start:end_idx])
+                else:
+                    trimmed = disk_files
+
+                # Files on disk (after trim) but not in export = removed
+                removed = trimmed - exported_names
+                if removed:
+                    self._removed_files[folder_path] = removed
+
         self._current_session_id = latest_session.id
 
         self._sync_dual_lists()
@@ -2663,8 +2718,14 @@ class SequenceLinkerUI(QWidget):
             msg += f"\nRestored {override_count} folder type override(s)."
         if per_trans_count > 0:
             msg += f"\nRestored {per_trans_count} per-transition overlap setting(s)."
+        removed_count = sum(len(v) for v in self._removed_files.values())
         if db_transition_settings and db_transition_settings.enabled:
             msg += f"\nRestored transition settings."
+        if removed_count > 0:
+            if db_removed_files:
+                msg += f"\nRestored {removed_count} removed file(s)."
+            else:
+                msg += f"\nRecovered {removed_count} file removal(s) from export history."
         if missing_count > 0:
             msg += f"\n{missing_count} file(s) no longer exist and were skipped."
 
@@ -2944,6 +3005,11 @@ class SequenceLinkerUI(QWidget):
 
             end_idx = total_in_folder - trim_end
             trimmed_files = folder_files[trim_start:end_idx]
+
+            # Filter out individually removed files
+            removed = self._removed_files.get(folder, set())
+            if removed:
+                trimmed_files = [f for f in trimmed_files if f not in removed]
 
             if not trimmed_files:
                 continue
@@ -3442,7 +3508,7 @@ class SequenceLinkerUI(QWidget):
         self._show_image_at_index(value)
 
     def _export_sequence(self) -> None:
-        """Export symlinks only (no transitions)."""
+        """Export symlinks only (no transitions), with progress bar."""
         dst = self.dst_path.currentText()
 
         if not self.source_folders:
@@ -3458,38 +3524,92 @@ class SequenceLinkerUI(QWidget):
             QMessageBox.warning(self, "Error", "No files to process!")
             return
 
+        dest = Path(dst)
+        copy_files = self.copy_files_check.isChecked()
+
         try:
-            results, session_id = self.manager.create_sequence_links(
-                sources=self.source_folders,
-                dest=Path(dst),
-                files=files,
-                trim_settings=self._folder_trim_settings
-            )
-
-            self._current_session_id = session_id
-
-            if session_id:
-                self._save_session_settings(session_id)
-
-            successful = sum(1 for r in results if r.success)
-            failed = sum(1 for r in results if not r.success)
-
-            if failed > 0:
-                QMessageBox.warning(
-                    self, "Partial Success",
-                    f"Linked {successful} files, {failed} failed.\n"
-                    f"Destination: {dst}"
-                )
-            else:
-                QMessageBox.information(
-                    self, "Success",
-                    f"Linked {successful} files to {dst}"
-                )
-
+            self.manager.validate_paths(self.source_folders, dest)
+            self.manager.cleanup_old_links(dest)
         except SymlinkError as e:
             QMessageBox.critical(self, "Error", str(e))
-        except Exception as e:
-            QMessageBox.critical(self, "Unexpected Error", str(e))
+            return
+
+        session_id = self.db.create_session(str(dest))
+        self._current_session_id = session_id
+
+        if session_id:
+            # Save trim settings
+            for folder, (trim_start, trim_end) in self._folder_trim_settings.items():
+                if trim_start > 0 or trim_end > 0:
+                    self.db.save_trim_settings(session_id, str(folder), trim_start, trim_end)
+            self._save_session_settings(session_id)
+
+        total = len(files)
+        link_type = "copies" if copy_files else "symlinks"
+        progress = QProgressDialog(
+            f"Exporting {total} files...", "Cancel", 0, total, self
+        )
+        progress.setWindowTitle("Export Sequence")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        successful = 0
+        errors = []
+
+        for i, (source_dir, filename, folder_idx, file_idx) in enumerate(files):
+            if progress.wasCanceled():
+                break
+
+            source_path = source_dir / filename
+            ext = source_path.suffix
+            link_name = f"seq_{i:05d}{ext}"
+            link_path = dest / link_name
+
+            progress.setLabelText(f"Exporting file {i + 1}/{total}: {filename}")
+            progress.setValue(i)
+
+            try:
+                if copy_files:
+                    import shutil
+                    shutil.copy2(source_path, link_path)
+                else:
+                    rel_source = Path(os.path.relpath(source_path.resolve(), dest.resolve()))
+                    link_path.symlink_to(rel_source)
+
+                successful += 1
+                self.db.record_symlink(
+                    session_id=session_id,
+                    source=str(source_path.resolve()),
+                    link=str(link_path),
+                    filename=filename,
+                    seq=i,
+                )
+            except OSError as e:
+                errors.append(f"{filename}: {e}")
+
+        progress.setValue(total)
+        progress.close()
+
+        if progress.wasCanceled():
+            QMessageBox.warning(
+                self, "Canceled",
+                f"Export canceled.\n"
+                f"Created {successful} {link_type} before cancellation.\n"
+                f"Destination: {dst}"
+            )
+        elif errors:
+            QMessageBox.warning(
+                self, "Partial Success",
+                f"Created {successful} {link_type}, {len(errors)} failed.\n"
+                f"First error: {errors[0]}\n"
+                f"Destination: {dst}"
+            )
+        else:
+            QMessageBox.information(
+                self, "Success",
+                f"Created {successful} {link_type} to {dst}"
+            )
 
     def _export_with_transitions(self) -> None:
         """Export with cross-dissolve transitions."""
@@ -3516,8 +3636,9 @@ class SequenceLinkerUI(QWidget):
             trans_dst = Path(dst)
 
         try:
+            copy_files = self.copy_files_check.isChecked()
             if len(self.source_folders) >= 2:
-                self._process_with_transitions(Path(dst), trans_dst, files, transition_settings)
+                self._process_with_transitions(Path(dst), trans_dst, files, transition_settings, copy_files)
             else:
                 # Fall back to regular export if less than 2 folders
                 self._export_sequence()
@@ -3527,27 +3648,46 @@ class SequenceLinkerUI(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Unexpected Error", str(e))
 
-    def _save_session_settings(self, session_id: int) -> None:
-        """Save transition settings and folder type overrides to database."""
+    def _save_session_settings(self, session_id: int, save_effective_types: bool = False) -> None:
+        """Save transition settings and folder type overrides to database.
+
+        Args:
+            session_id: The session ID.
+            save_effective_types: If True, save the effective folder type for every folder
+                (used by "Export with Transitions" to preserve MAIN/TRANSITION assignments).
+                If False, only save explicit overrides and trim settings.
+        """
         self.db.save_transition_settings(session_id, self._get_transition_settings())
 
-        for folder in self.source_folders:
+        for folder_idx, folder in enumerate(self.source_folders):
             trim_start, trim_end = self._folder_trim_settings.get(folder, (0, 0))
-            folder_type = self._folder_type_overrides.get(folder, FolderType.AUTO)
-            if trim_start > 0 or trim_end > 0 or folder_type != FolderType.AUTO:
+            if save_effective_types:
+                # Save effective type so restore doesn't rely on index-based auto-detection
+                effective_type = self._get_effective_folder_type(folder_idx, folder)
                 self.db.save_trim_settings(
-                    session_id, str(folder), trim_start, trim_end, folder_type
+                    session_id, str(folder), trim_start, trim_end, effective_type
                 )
+            else:
+                folder_type = self._folder_type_overrides.get(folder, FolderType.AUTO)
+                if trim_start > 0 or trim_end > 0 or folder_type != FolderType.AUTO:
+                    self.db.save_trim_settings(
+                        session_id, str(folder), trim_start, trim_end, folder_type
+                    )
 
         for folder, pts in self._per_transition_settings.items():
             self.db.save_per_transition_settings(session_id, pts)
+
+        for folder, removed in self._removed_files.items():
+            if removed:
+                self.db.save_removed_files(session_id, str(folder), list(removed))
 
     def _process_with_transitions(
         self,
         symlink_dest: Path,
         trans_dest: Path,
         files: list[tuple],
-        settings: TransitionSettings
+        settings: TransitionSettings,
+        copy_files: bool = False
     ) -> None:
         """Process files with cross-dissolve transitions."""
         self.manager.validate_paths(self.source_folders, symlink_dest)
@@ -3560,7 +3700,7 @@ class SequenceLinkerUI(QWidget):
 
         session_id = self.db.create_session(str(symlink_dest))
         self._current_session_id = session_id
-        self._save_session_settings(session_id)
+        self._save_session_settings(session_id, save_effective_types=True)
 
         files_by_folder: dict[Path, list[str]] = {}
         for source_dir, filename, folder_idx, file_idx in files:
@@ -3601,6 +3741,8 @@ class SequenceLinkerUI(QWidget):
         blend_count = 0
         errors = []
 
+        num_folders = len(self.source_folders)
+
         for folder_idx, folder in enumerate(self.source_folders):
             if progress.wasCanceled():
                 break
@@ -3608,6 +3750,11 @@ class SequenceLinkerUI(QWidget):
             folder_files = files_by_folder.get(folder, [])
             if not folder_files:
                 continue
+
+            folder_label = folder.name
+            progress.setLabelText(
+                f"Processing folder {folder_idx + 1}/{num_folders}: {folder_label}..."
+            )
 
             num_files = len(folder_files)
 
@@ -3690,10 +3837,13 @@ class SequenceLinkerUI(QWidget):
                     link_name = f"seq_{output_seq:05d}{ext}"
                     link_path = symlink_dest / link_name
 
-                    rel_source = Path(os.path.relpath(source_path.resolve(), symlink_dest.resolve()))
-
                     try:
-                        link_path.symlink_to(rel_source)
+                        if copy_files:
+                            import shutil
+                            shutil.copy2(source_path, link_path)
+                        else:
+                            rel_source = Path(os.path.relpath(source_path.resolve(), symlink_dest.resolve()))
+                            link_path.symlink_to(rel_source)
                         symlink_count += 1
                         self.db.record_symlink(
                             session_id, str(source_path.resolve()),
@@ -3754,29 +3904,32 @@ class SequenceLinkerUI(QWidget):
                                     )
                                 output_seq += 1
 
-                            progress.setLabelText("Generating sequence...")
+                            progress.setLabelText(
+                                f"Processing folder {folder_idx + 1}/{num_folders}: {folder_label}..."
+                            )
 
         progress.close()
 
+        link_type = "copies" if copy_files else "symlinks"
         if progress.wasCanceled():
             QMessageBox.warning(
                 self, "Canceled",
                 f"Operation canceled.\n"
-                f"Created {symlink_count} symlinks, {blend_count} blended frames."
+                f"Created {symlink_count} {link_type}, {blend_count} blended frames."
             )
         elif errors:
             QMessageBox.warning(
                 self, "Partial Success",
-                f"Created {symlink_count} symlinks, {blend_count} blended frames.\n"
+                f"Created {symlink_count} {link_type}, {blend_count} blended frames.\n"
                 f"{len(errors)} errors occurred.\n"
                 f"First error: {errors[0] if errors else 'N/A'}\n"
-                f"Symlinks: {symlink_dest}\n"
+                f"{link_type.title()}: {symlink_dest}\n"
                 f"Blends: {trans_dest}"
             )
         else:
             QMessageBox.information(
                 self, "Success",
-                f"Created {symlink_count} symlinks and {blend_count} blended frames.\n"
-                f"Symlinks: {symlink_dest}\n"
+                f"Created {symlink_count} {link_type} and {blend_count} blended frames.\n"
+                f"{link_type.title()}: {symlink_dest}\n"
                 f"Blends: {trans_dest}"
             )

@@ -82,6 +82,14 @@ class DatabaseManager:
                     right_overlap INTEGER DEFAULT 16,
                     UNIQUE(session_id, trans_folder)
                 );
+
+                CREATE TABLE IF NOT EXISTS removed_files (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER REFERENCES symlink_sessions(id) ON DELETE CASCADE,
+                    source_folder TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    UNIQUE(session_id, source_folder, filename)
+                );
             """)
 
             # Migration: add folder_type column if it doesn't exist
@@ -614,3 +622,50 @@ class DatabaseManager:
             )
             for row in rows
         }
+
+    def save_removed_files(
+        self,
+        session_id: int,
+        source_folder: str,
+        filenames: list[str]
+    ) -> None:
+        """Save removed files for a folder in a session.
+
+        Args:
+            session_id: The session ID.
+            source_folder: Path to the source folder.
+            filenames: List of removed filenames.
+        """
+        try:
+            with self._connect() as conn:
+                for filename in filenames:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO removed_files
+                           (session_id, source_folder, filename)
+                           VALUES (?, ?, ?)""",
+                        (session_id, source_folder, filename)
+                    )
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to save removed files: {e}") from e
+
+    def get_removed_files(self, session_id: int) -> dict[str, set[str]]:
+        """Get all removed files for a session.
+
+        Args:
+            session_id: The session ID.
+
+        Returns:
+            Dict mapping source folder paths to sets of removed filenames.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT source_folder, filename FROM removed_files WHERE session_id = ?",
+                (session_id,)
+            ).fetchall()
+
+        result: dict[str, set[str]] = {}
+        for folder, filename in rows:
+            if folder not in result:
+                result[folder] = set()
+            result[folder].add(filename)
+        return result

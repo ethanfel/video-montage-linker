@@ -90,6 +90,16 @@ class DatabaseManager:
                     filename TEXT NOT NULL,
                     UNIQUE(session_id, source_folder, filename)
                 );
+
+                CREATE TABLE IF NOT EXISTS direct_transition_settings (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER REFERENCES symlink_sessions(id) ON DELETE CASCADE,
+                    after_folder TEXT NOT NULL,
+                    frame_count INTEGER DEFAULT 16,
+                    method TEXT DEFAULT 'film',
+                    enabled INTEGER DEFAULT 1,
+                    UNIQUE(session_id, after_folder)
+                );
             """)
 
             # Migration: add folder_type column if it doesn't exist
@@ -122,8 +132,26 @@ class DatabaseManager:
             except sqlite3.OperationalError:
                 conn.execute("ALTER TABLE transition_settings ADD COLUMN rife_binary_path TEXT")
 
+            # Migration: add folder_order column if it doesn't exist
+            try:
+                conn.execute("SELECT folder_order FROM sequence_trim_settings LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE sequence_trim_settings ADD COLUMN folder_order INTEGER DEFAULT 0")
+
             # Migration: remove overlap_frames from transition_settings (now per-transition)
             # We'll keep it for backward compatibility but won't use it
+
+    def clear_session_data(self, session_id: int) -> None:
+        """Delete all data for a session (symlinks, settings, etc.) but keep the session row."""
+        try:
+            with self._connect() as conn:
+                for table in (
+                    'symlinks', 'sequence_trim_settings', 'transition_settings',
+                    'per_transition_settings', 'removed_files', 'direct_transition_settings',
+                ):
+                    conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to clear session data: {e}") from e
 
     def _connect(self) -> sqlite3.Connection:
         """Create a database connection with foreign keys enabled."""
@@ -328,7 +356,8 @@ class DatabaseManager:
         source_folder: str,
         trim_start: int,
         trim_end: int,
-        folder_type: FolderType = FolderType.AUTO
+        folder_type: FolderType = FolderType.AUTO,
+        folder_order: int = 0,
     ) -> None:
         """Save trim settings for a folder in a session.
 
@@ -338,6 +367,7 @@ class DatabaseManager:
             trim_start: Number of images to trim from start.
             trim_end: Number of images to trim from end.
             folder_type: The folder type (auto, main, or transition).
+            folder_order: Position of this folder in source_folders list.
 
         Raises:
             DatabaseError: If saving fails.
@@ -346,13 +376,14 @@ class DatabaseManager:
             with self._connect() as conn:
                 conn.execute(
                     """INSERT INTO sequence_trim_settings
-                       (session_id, source_folder, trim_start, trim_end, folder_type)
-                       VALUES (?, ?, ?, ?, ?)
+                       (session_id, source_folder, trim_start, trim_end, folder_type, folder_order)
+                       VALUES (?, ?, ?, ?, ?, ?)
                        ON CONFLICT(session_id, source_folder)
                        DO UPDATE SET trim_start=excluded.trim_start,
                                      trim_end=excluded.trim_end,
-                                     folder_type=excluded.folder_type""",
-                    (session_id, source_folder, trim_start, trim_end, folder_type.value)
+                                     folder_type=excluded.folder_type,
+                                     folder_order=excluded.folder_order""",
+                    (session_id, source_folder, trim_start, trim_end, folder_type.value, folder_order)
                 )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to save trim settings: {e}") from e
@@ -403,6 +434,62 @@ class DatabaseManager:
             ).fetchall()
 
         return {row[0]: (row[1], row[2]) for row in rows}
+
+    def get_all_folder_settings(self, session_id: int) -> dict[str, tuple[int, int, FolderType]]:
+        """Get all folder settings (trim + type) for a session, unordered.
+
+        Returns:
+            Dict mapping source_folder to (trim_start, trim_end, folder_type).
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT source_folder, trim_start, trim_end, folder_type
+                   FROM sequence_trim_settings WHERE session_id = ?""",
+                (session_id,)
+            ).fetchall()
+
+        result = {}
+        for row in rows:
+            try:
+                ft = FolderType(row[3]) if row[3] else FolderType.AUTO
+            except ValueError:
+                ft = FolderType.AUTO
+            result[row[0]] = (row[1], row[2], ft)
+        return result
+
+    def get_ordered_folders(self, session_id: int) -> list[tuple[str, FolderType, int, int]]:
+        """Get all folders for a session in saved order.
+
+        Returns:
+            List of (source_folder, folder_type, trim_start, trim_end) sorted by folder_order.
+            Returns empty list if folder_order is not meaningful (all zeros from
+            pre-migration sessions), so the caller falls back to symlink-derived order.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT source_folder, folder_type, trim_start, trim_end, folder_order
+                   FROM sequence_trim_settings WHERE session_id = ?
+                   ORDER BY folder_order""",
+                (session_id,)
+            ).fetchall()
+
+        if not rows:
+            return []
+
+        # If all folder_order values are 0, this is a pre-migration session
+        # where the ordering is not meaningful — return empty to trigger
+        # the legacy symlink-derived ordering path.
+        if len(rows) > 1 and all(row[4] == 0 for row in rows):
+            return []
+
+        result = []
+        for row in rows:
+            try:
+                ft = FolderType(row[1]) if row[1] else FolderType.AUTO
+            except ValueError:
+                ft = FolderType.AUTO
+            result.append((row[0], ft, row[2], row[3]))
+        return result
 
     def save_transition_settings(
         self,
@@ -669,3 +756,41 @@ class DatabaseManager:
                 result[folder] = set()
             result[folder].add(filename)
         return result
+
+    def save_direct_transition(
+        self,
+        session_id: int,
+        after_folder: str,
+        frame_count: int,
+        method: str,
+        enabled: bool,
+    ) -> None:
+        """Save direct interpolation settings for a folder transition."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO direct_transition_settings
+                       (session_id, after_folder, frame_count, method, enabled)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(session_id, after_folder)
+                       DO UPDATE SET frame_count=excluded.frame_count,
+                                     method=excluded.method,
+                                     enabled=excluded.enabled""",
+                    (session_id, after_folder, frame_count, method, 1 if enabled else 0)
+                )
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to save direct transition: {e}") from e
+
+    def get_direct_transitions(self, session_id: int) -> list[tuple[str, int, str, bool]]:
+        """Get direct interpolation settings for a session.
+
+        Returns:
+            List of (after_folder, frame_count, method, enabled) tuples.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT after_folder, frame_count, method, enabled "
+                "FROM direct_transition_settings WHERE session_id = ?",
+                (session_id,)
+            ).fetchall()
+        return [(r[0], r[1], r[2], bool(r[3])) for r in rows]

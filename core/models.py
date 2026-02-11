@@ -84,6 +84,29 @@ class DirectTransitionSettings:
 
 
 @dataclass
+class VideoPreset:
+    """Preset for video encoding via ffmpeg."""
+    label: str           # Display name
+    container: str       # 'mp4' or 'webm'
+    codec: str           # ffmpeg codec: libx264, libx265, libvpx-vp9, libaom-av1
+    crf: int
+    pixel_format: str = 'yuv420p'
+    preset: str = 'medium'           # x264/x265 speed preset
+    max_height: Optional[int] = None  # Downscale filter
+    extra_args: list[str] = field(default_factory=list)
+
+VIDEO_PRESETS: dict[str, VideoPreset] = {
+    'web_streaming':  VideoPreset('Web Streaming',   'mp4',  'libx264',    23, preset='medium'),
+    'high_quality':   VideoPreset('High Quality',    'mp4',  'libx264',    18, preset='slow'),
+    'archive':        VideoPreset('Archive (H.265)', 'mp4',  'libx265',    18, preset='slow', extra_args=['-tag:v', 'hvc1']),
+    'social_media':   VideoPreset('Social Media',    'mp4',  'libx264',    23, preset='fast', max_height=1080),
+    'fast_preview':   VideoPreset('Fast Preview',    'mp4',  'libx264',    28, preset='ultrafast'),
+    'webm_vp9':       VideoPreset('WebM VP9',        'webm', 'libvpx-vp9', 30, extra_args=['-b:v', '0']),
+    'webm_av1':       VideoPreset('WebM AV1',        'webm', 'libaom-av1', 30, extra_args=['-b:v', '0', '-strict', 'experimental']),
+}
+
+
+@dataclass
 class BlendResult:
     """Result of an image blend operation."""
     output_path: Path

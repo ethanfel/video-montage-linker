@@ -53,11 +53,16 @@ from core import (
     TransitionSettings,
     PerTransitionSettings,
     DirectTransitionSettings,
+    VideoPreset,
+    VIDEO_PRESETS,
     TransitionSpec,
     SymlinkError,
     DatabaseManager,
     TransitionGenerator,
     RifeDownloader,
+    encode_image_sequence,
+    encode_from_file_list,
+    find_ffmpeg,
     PracticalRifeEnv,
     FilmEnv,
     SymlinkManager,
@@ -425,6 +430,7 @@ class SequenceLinkerUI(QWidget):
         self._per_transition_settings: dict[Path, PerTransitionSettings] = {}
         self._direct_transitions: dict[Path, DirectTransitionSettings] = {}
         self._removed_files: dict[Path, set[str]] = {}
+        self._sequence_frame_count: int = 0  # Full output count including transition frames
         self._current_session_id: Optional[int] = None
         self.db = DatabaseManager()
         self.manager = SymlinkManager(self.db)
@@ -513,11 +519,56 @@ class SequenceLinkerUI(QWidget):
             "height: 40px; font-weight: bold;"
         )
 
+        self.encode_video_btn = QPushButton("Encode Video Only")
+        self.encode_video_btn.setToolTip(
+            "Encode an existing seq_* image sequence in the destination folder to video.\n"
+            "No export is performed — frames must already exist."
+        )
+
+        self.save_session_btn = QPushButton("Save Session")
+        self.save_session_btn.setToolTip(
+            "Save the current session state (folders, files, trim, transitions, etc.)\n"
+            "so you can resume exactly where you left off."
+        )
+
+        self.restore_session_btn = QPushButton("Restore Session")
+        self.restore_session_btn.setToolTip(
+            "Pick a previously saved session to restore."
+        )
+
         self.copy_files_check = QCheckBox("Copy files (instead of symlinks)")
         self.copy_files_check.setToolTip(
             "Copy actual files instead of creating symlinks.\n"
             "Use this when the destination is accessed from Docker or a remote system."
         )
+
+        # Export options group (collapsible via checkable)
+        self.export_options_group = QGroupBox("Export Options")
+        self.export_options_group.setCheckable(True)
+        self.export_options_group.setChecked(False)
+
+        # Range selection
+        self.range_start_spin = QSpinBox()
+        self.range_start_spin.setMinimum(0)
+        self.range_start_spin.setMaximum(0)
+        self.range_start_spin.setToolTip("First frame index to export")
+
+        self.range_end_spin = QSpinBox()
+        self.range_end_spin.setMinimum(0)
+        self.range_end_spin.setMaximum(0)
+        self.range_end_spin.setToolTip("Last frame index to export")
+
+        self.range_reset_btn = QPushButton("Reset Range")
+        self.range_reset_btn.setToolTip("Reset range to full sequence")
+
+        # Video encoding
+        self.video_export_check = QCheckBox("Encode video")
+        self.video_export_check.setToolTip("Encode output frames to video after export")
+
+        self.video_preset_combo = QComboBox()
+        for key, vp in VIDEO_PRESETS.items():
+            self.video_preset_combo.addItem(vp.label, key)
+        self.video_preset_combo.setToolTip("Video encoding preset")
 
         # Preview tabs
         self.preview_tabs = QTabWidget()
@@ -580,14 +631,15 @@ class SequenceLinkerUI(QWidget):
 
         # Sequence table (2-column: Main Frame | Transition Frame) with timeline background
         self.sequence_table = TimelineTreeWidget()
-        self.sequence_table.setHeaderLabels(["Main Frame", "Transition Frame"])
-        self.sequence_table.setColumnCount(2)
+        self.sequence_table.setHeaderLabels(["Main Frame", "Transition Frame", "#"])
+        self.sequence_table.setColumnCount(3)
         self.sequence_table.setRootIsDecorated(False)
         self.sequence_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.sequence_table.setAlternatingRowColors(True)
-        self.sequence_table.header().setStretchLastSection(True)
+        self.sequence_table.header().setStretchLastSection(False)
         self.sequence_table.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.sequence_table.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.sequence_table.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
 
         # Cross-dissolve transition settings group - horizontal layout
         self.transition_group = QGroupBox("Cross-Dissolve Transitions")
@@ -872,11 +924,11 @@ class SequenceLinkerUI(QWidget):
         transition_layout.addStretch()
         self.transition_group.setLayout(transition_layout)
 
-        # File list action buttons
+        # File list action buttons (refresh far from remove to avoid misclicks)
         btn_layout = QHBoxLayout()
         btn_layout.addWidget(self.remove_files_btn)
-        btn_layout.addWidget(self.refresh_btn)
         btn_layout.addStretch()
+        btn_layout.addWidget(self.refresh_btn)
 
         # Video preview tab layout
         video_tab_layout = QVBoxLayout(self.video_tab)
@@ -952,8 +1004,28 @@ class SequenceLinkerUI(QWidget):
         # Export buttons layout
         export_layout = QHBoxLayout()
         export_layout.addWidget(self.copy_files_check)
+        export_layout.addWidget(self.save_session_btn)
+        export_layout.addWidget(self.restore_session_btn)
         export_layout.addWidget(self.export_btn)
         export_layout.addWidget(self.export_trans_btn)
+        export_layout.addWidget(self.encode_video_btn)
+
+        # Export options group layout
+        export_opts_layout = QVBoxLayout()
+        range_layout = QHBoxLayout()
+        range_layout.addWidget(QLabel("Range:"))
+        range_layout.addWidget(self.range_start_spin)
+        range_layout.addWidget(QLabel("—"))
+        range_layout.addWidget(self.range_end_spin)
+        range_layout.addWidget(self.range_reset_btn)
+        range_layout.addStretch()
+        export_opts_layout.addLayout(range_layout)
+
+        video_layout = QHBoxLayout()
+        video_layout.addWidget(self.video_export_check)
+        video_layout.addWidget(self.video_preset_combo, 1)
+        export_opts_layout.addLayout(video_layout)
+        self.export_options_group.setLayout(export_opts_layout)
 
         # Assemble right panel
         right_layout.addLayout(dst_layout)
@@ -961,6 +1033,7 @@ class SequenceLinkerUI(QWidget):
         right_layout.addWidget(self.transition_group)
         right_layout.addWidget(self.content_splitter, 1)
         right_layout.addLayout(export_layout)
+        right_layout.addWidget(self.export_options_group)
 
         # === MAIN SPLITTER: Source Panel | Main Content ===
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -990,8 +1063,21 @@ class SequenceLinkerUI(QWidget):
         self.refresh_btn.clicked.connect(self._refresh_files)
 
         # Export buttons
+        self.save_session_btn.clicked.connect(self._save_session)
+        self.restore_session_btn.clicked.connect(self._pick_and_restore_session)
         self.export_btn.clicked.connect(self._export_sequence)
         self.export_trans_btn.clicked.connect(self._export_with_transitions)
+        self.encode_video_btn.clicked.connect(self._encode_video_only)
+
+        # Export options signals
+        self.video_export_check.toggled.connect(self.video_preset_combo.setEnabled)
+        self.range_reset_btn.clicked.connect(self._reset_export_range)
+        self.range_start_spin.valueChanged.connect(
+            lambda v: self.range_end_spin.setMinimum(v)
+        )
+        self.range_end_spin.valueChanged.connect(
+            lambda v: self.range_start_spin.setMaximum(v)
+        )
 
         # Connect reorder signals
         self.file_list.model().rowsMoved.connect(self._recalculate_sequence_names)
@@ -1005,6 +1091,7 @@ class SequenceLinkerUI(QWidget):
 
         # Connect folder selection to update video list
         self.source_list.currentItemChanged.connect(self._on_folder_selected)
+        self.source_list.itemClicked.connect(self._on_source_item_clicked)
 
         # Video player signals
         self.video_combo.currentIndexChanged.connect(self._on_video_selected)
@@ -1454,33 +1541,52 @@ class SequenceLinkerUI(QWidget):
 
     def _update_sequence_table(self, _=None) -> None:
         """Update the 2-column sequence table showing Main/Transition frame pairing."""
+        self.sequence_table.setUpdatesEnabled(False)
         self.sequence_table.clear()
 
         if not self.source_folders:
+            self._sequence_frame_count = 0
+            self.sequence_table.setUpdatesEnabled(True)
             self._update_timeline_display()
+            self._update_export_range_max()
             return
 
         files = self._get_files_in_order()
         if not files:
+            self._sequence_frame_count = 0
+            self.sequence_table.setUpdatesEnabled(True)
             self._update_timeline_display()
+            self._update_export_range_max()
             return
 
-        # Group files by folder
+        # Group files by folder (from file_list which only has MAIN folders)
         files_by_folder: dict[Path, list[str]] = {}
         for source_dir, filename, folder_idx, file_idx in files:
             if source_dir not in files_by_folder:
                 files_by_folder[source_dir] = []
             files_by_folder[source_dir].append(filename)
 
+        # Also include TRANSITION folder files (not in file_list but needed for blending)
+        for idx, folder in enumerate(self.source_folders):
+            if folder not in files_by_folder:
+                ft = self._get_effective_folder_type(idx, folder)
+                if ft == FolderType.TRANSITION:
+                    trans_files = self.manager.get_supported_files([folder])
+                    if trans_files:
+                        files_by_folder[folder] = [f for _, f in trans_files]
+
         # Check if transitions are enabled
         if not self.transition_group.isChecked():
             # Just show symlinks in Main column only
-            for source_dir, filename, folder_idx, file_idx in files:
+            for frame_num, (source_dir, filename, folder_idx, file_idx) in enumerate(files):
                 seq_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}"
-                item = QTreeWidgetItem([f"{seq_name} ({filename})", ""])
+                item = QTreeWidgetItem([f"{seq_name} ({filename})", "", str(frame_num)])
                 item.setData(0, Qt.ItemDataRole.UserRole, (source_dir, filename, folder_idx, file_idx, 'symlink'))
                 self.sequence_table.addTopLevelItem(item)
+            self._sequence_frame_count = len(files)
+            self.sequence_table.setUpdatesEnabled(True)
             self._update_timeline_display()
+            self._update_export_range_max()
             return
 
         # Get transition specs
@@ -1539,7 +1645,8 @@ class SequenceLinkerUI(QWidget):
                         blend_idx_in_overlap = file_idx - main_overlap_start
 
                 # Check if in consumed zone at start of folder (skip these)
-                if trans_at_start:
+                # But don't skip if the frame is also in the blend zone at the end
+                if trans_at_start and not should_blend:
                     right_overlap = trans_at_start.right_overlap
                     if file_idx < right_overlap:
                         # These frames are consumed by the blend - skip them
@@ -1559,7 +1666,7 @@ class SequenceLinkerUI(QWidget):
                     main_text = f"[B] {seq_name} ({filename})"
                     trans_text = f"→ {trans_file}"
 
-                    item = QTreeWidgetItem([main_text, trans_text])
+                    item = QTreeWidgetItem([main_text, trans_text, str(output_seq)])
                     item.setData(0, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'blend', output_seq))
                     item.setData(1, Qt.ItemDataRole.UserRole, (blend_trans.trans_folder, trans_file))
                     # Blue color for blend frames
@@ -1567,12 +1674,14 @@ class SequenceLinkerUI(QWidget):
                     item.setForeground(1, QColor(100, 150, 255))
                     output_seq += 1
                 elif folder_type == FolderType.TRANSITION:
-                    # Transition folder files go in Transition column only (no output file)
-                    item = QTreeWidgetItem(["", f"({filename})"])
-                    item.setData(1, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'symlink', -1))
+                    # Transition folder middle frames — output as symlinks just like MAIN
+                    item = QTreeWidgetItem([f"[T] {seq_name} ({filename})", "", str(output_seq)])
+                    item.setData(0, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'symlink', output_seq))
+                    item.setForeground(0, QColor(180, 140, 255))  # Purple tint for transition frames
+                    output_seq += 1
                 else:
                     # Main folder files go in Main column only
-                    item = QTreeWidgetItem([f"{seq_name} ({filename})", ""])
+                    item = QTreeWidgetItem([f"{seq_name} ({filename})", "", str(output_seq)])
                     item.setData(0, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'symlink', output_seq))
                     output_seq += 1
 
@@ -1585,8 +1694,11 @@ class SequenceLinkerUI(QWidget):
                     # Add direct interpolation row after this folder's files
                     self._add_direct_interpolation_row(folder, pair_idx_b)
 
+        self._sequence_frame_count = output_seq
+        self.sequence_table.setUpdatesEnabled(True)
         # Update timeline display after rebuilding sequence table
         self._update_timeline_display()
+        self._update_export_range_max()
 
     def _add_direct_interpolation_row(self, after_folder: Path, next_folder_idx: int) -> None:
         """Add a clickable direct interpolation row between MAIN sequences.
@@ -2199,9 +2311,16 @@ class SequenceLinkerUI(QWidget):
     def _add_source_folder(
         self,
         folder_path: Optional[str] = None,
-        folder_type: Optional[FolderType] = None
+        folder_type: Optional[FolderType] = None,
+        insert_index: Optional[int] = None,
     ) -> None:
-        """Add a source folder via file dialog or direct path."""
+        """Add a source folder via file dialog or direct path.
+
+        Args:
+            folder_path: Path string, or None to open a file dialog.
+            folder_type: Explicit type override (MAIN/TRANSITION). None = position-based.
+            insert_index: Position in source_folders to insert at. None = append.
+        """
         if folder_path and not isinstance(folder_path, str):
             folder_path = None
 
@@ -2214,9 +2333,20 @@ class SequenceLinkerUI(QWidget):
             )
 
         if path:
-            folder = Path(path)
+            folder = Path(path).resolve()
             if folder.is_dir() and folder not in self.source_folders:
-                self.source_folders.append(folder)
+                if insert_index is not None and 0 <= insert_index <= len(self.source_folders):
+                    # Pin effective types for all folders at/after the insert point
+                    # so the index shift doesn't flip their position-based types.
+                    for j in range(insert_index, len(self.source_folders)):
+                        f = self.source_folders[j]
+                        if f not in self._folder_type_overrides:
+                            self._folder_type_overrides[f] = self._get_effective_folder_type(j, f)
+                    self.source_folders.insert(insert_index, folder)
+                else:
+                    self.source_folders.append(folder)
+                if folder_type is not None and folder_type != FolderType.AUTO:
+                    self._folder_type_overrides[folder] = folder_type
                 self.last_directory = str(folder.parent)
                 self._sync_dual_lists()
                 self._refresh_files()
@@ -2241,6 +2371,7 @@ class SequenceLinkerUI(QWidget):
             if len(common_prefix) <= 1:
                 common_prefix = ""
 
+        num_folders = len(self.source_folders)
         for i, folder in enumerate(self.source_folders):
             folder_type = self._get_effective_folder_type(i, folder)
 
@@ -2272,6 +2403,30 @@ class SequenceLinkerUI(QWidget):
 
             self.source_list.addItem(item)
 
+            # After a MAIN folder, insert a placeholder if the next folder is not TRANSITION
+            if folder_type == FolderType.MAIN:
+                next_is_transition = False
+                if i + 1 < num_folders:
+                    next_type = self._get_effective_folder_type(
+                        i + 1, self.source_folders[i + 1]
+                    )
+                    next_is_transition = (next_type == FolderType.TRANSITION)
+                if not next_is_transition:
+                    ph = QListWidgetItem("   [T] (click or drop to add transition)")
+                    ph.setData(Qt.ItemDataRole.UserRole, None)
+                    ph.setData(Qt.ItemDataRole.UserRole + 1, i + 1)  # insert index
+                    ph.setForeground(QColor(130, 130, 130))
+                    font = ph.font()
+                    font.setItalic(True)
+                    ph.setFont(font)
+                    ph.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                    ph.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    )
+                    self.source_list.addItem(ph)
+
     def _get_effective_folder_type(self, index: int, folder: Path) -> FolderType:
         """Get the effective folder type considering overrides."""
         if folder in self._folder_type_overrides:
@@ -2279,6 +2434,36 @@ class SequenceLinkerUI(QWidget):
             if override != FolderType.AUTO:
                 return override
         return FolderType.MAIN if index % 2 == 0 else FolderType.TRANSITION
+
+    def _is_placeholder_item(self, item: QListWidgetItem) -> bool:
+        """Return True if the item is a transition placeholder slot."""
+        if item is None:
+            return False
+        return (
+            item.data(Qt.ItemDataRole.UserRole) is None
+            and item.data(Qt.ItemDataRole.UserRole + 1) is not None
+        )
+
+    def _get_placeholder_insert_index(self, item: QListWidgetItem) -> Optional[int]:
+        """Return the source_folders insert index stored on a placeholder item, or None."""
+        if item is None:
+            return None
+        idx = item.data(Qt.ItemDataRole.UserRole + 1)
+        return int(idx) if idx is not None else None
+
+    def _get_main_folder_indices(self) -> dict[Path, int]:
+        """Return a map from each MAIN folder to its MAIN-only sequence index.
+
+        Transition folders are excluded so that inserting or removing a
+        transition never changes the seq numbers of existing MAIN folders.
+        """
+        indices: dict[Path, int] = {}
+        main_count = 0
+        for i, folder in enumerate(self.source_folders):
+            if self._get_effective_folder_type(i, folder) == FolderType.MAIN:
+                indices[folder] = main_count
+                main_count += 1
+        return indices
 
     def _update_flow_arrows(self) -> None:
         """Update visual indicators."""
@@ -2301,8 +2486,12 @@ class SequenceLinkerUI(QWidget):
 
         folder, idx = result
         if idx > 0:
-            self.source_folders[idx], self.source_folders[idx - 1] = \
-                self.source_folders[idx - 1], self.source_folders[idx]
+            other = self.source_folders[idx - 1]
+            type_a = self._get_effective_folder_type(idx, folder)
+            type_b = self._get_effective_folder_type(idx - 1, other)
+            self.source_folders[idx], self.source_folders[idx - 1] = other, folder
+            self._folder_type_overrides[folder] = type_a
+            self._folder_type_overrides[other] = type_b
             self._sync_dual_lists()
             self._refresh_files()
             self._update_flow_arrows()
@@ -2316,8 +2505,12 @@ class SequenceLinkerUI(QWidget):
 
         folder, idx = result
         if idx < len(self.source_folders) - 1:
-            self.source_folders[idx], self.source_folders[idx + 1] = \
-                self.source_folders[idx + 1], self.source_folders[idx]
+            other = self.source_folders[idx + 1]
+            type_a = self._get_effective_folder_type(idx, folder)
+            type_b = self._get_effective_folder_type(idx + 1, other)
+            self.source_folders[idx], self.source_folders[idx + 1] = other, folder
+            self._folder_type_overrides[folder] = type_a
+            self._folder_type_overrides[other] = type_b
             self._sync_dual_lists()
             self._refresh_files()
             self._update_flow_arrows()
@@ -2360,6 +2553,7 @@ class SequenceLinkerUI(QWidget):
 
         # Update the sequence table (With Transitions tab)
         self._update_sequence_table()
+        self._update_export_range_max()
 
         self._update_flow_arrows()
 
@@ -2533,57 +2727,70 @@ class SequenceLinkerUI(QWidget):
                 self._try_resume_session(path)
 
     def _try_resume_session(self, dest_path: str) -> bool:
-        """Try to resume a previous session for the given destination."""
+        """Try to resume the latest session for the given destination."""
         dest = Path(dest_path).resolve()
         dest_str = str(dest)
 
         self._last_resumed_dest = dest_str
 
         sessions = self.db.get_sessions_by_destination(dest_str)
-
         if not sessions:
             return False
 
-        latest_session = sessions[0]
-        symlinks = self.db.get_symlinks_by_session(latest_session.id)
+        return self._restore_session_by_id(sessions[0])
 
-        if not symlinks:
+    def _restore_session_by_id(self, session: 'SessionRecord', silent: bool = False) -> bool:
+        """Restore a specific session by its record.
+
+        Args:
+            session: The SessionRecord to restore.
+            silent: If True, don't show the summary dialog.
+
+        Returns:
+            True if session was restored successfully.
+        """
+        symlinks = self.db.get_symlinks_by_session(session.id)
+        ordered_folders = self.db.get_ordered_folders(session.id)
+        db_folder_settings = self.db.get_all_folder_settings(session.id)
+        db_transition_settings = self.db.get_transition_settings(session.id)
+        db_per_trans_settings = self.db.get_all_per_transition_settings(session.id)
+        db_removed_files = self.db.get_removed_files(session.id)
+        db_direct_transitions = self.db.get_direct_transitions(session.id)
+
+        if not symlinks and not ordered_folders and not db_folder_settings:
+            if not silent:
+                QMessageBox.warning(self, "Empty Session", "This session has no data.")
             return False
 
-        db_trim_settings = self.db.get_all_trim_settings(latest_session.id)
-        db_folder_types = self.db.get_folder_type_overrides(latest_session.id)
-        db_transition_settings = self.db.get_transition_settings(latest_session.id)
-        db_per_trans_settings = self.db.get_all_per_transition_settings(latest_session.id)
-        db_removed_files = self.db.get_removed_files(latest_session.id)
-
+        # Build file data from symlink records (only MAIN folders have these)
         # Pattern for new continuous format: seq_00000
         continuous_pattern = re.compile(r'seq_(\d+)')
         # Pattern for old folder-based format: seq01_0000
         folder_pattern = re.compile(r'seq(\d+)_(\d+)')
 
         folder_data: dict[str, tuple[int, list[tuple[int, str]]]] = {}
-        folder_first_seq: dict[str, int] = {}  # Track first sequence number per folder
+        folder_first_seq: dict[str, int] = {}
         missing_count = 0
+        _folder_exists_cache: dict[str, bool] = {}
 
         for link in symlinks:
             source_path = Path(link.source_path)
-            if not source_path.exists():
+            folder = str(source_path.parent)
+
+            if folder not in _folder_exists_cache:
+                _folder_exists_cache[folder] = Path(folder).is_dir()
+            if not _folder_exists_cache[folder]:
                 missing_count += 1
                 continue
-
-            folder = str(source_path.parent)
             link_name = Path(link.link_path).stem
 
-            # Try continuous format first (new format)
             match = continuous_pattern.match(link_name)
             if match:
                 seq_num = int(match.group(1))
-                # Use sequence number for ordering, folder from source_path
                 if folder not in folder_first_seq:
                     folder_first_seq[folder] = seq_num
                 file_idx = seq_num
             else:
-                # Try old folder-based format
                 match = folder_pattern.match(link_name)
                 if match:
                     folder_idx_from_name = int(match.group(1)) - 1
@@ -2591,44 +2798,169 @@ class SequenceLinkerUI(QWidget):
                     if folder not in folder_first_seq:
                         folder_first_seq[folder] = folder_idx_from_name * 10000 + file_idx
                 else:
-                    # Fallback to database sequence number
                     file_idx = link.sequence_number
                     if folder not in folder_first_seq:
                         folder_first_seq[folder] = file_idx
 
             if folder not in folder_data:
-                folder_data[folder] = (0, [])  # folder_idx will be set later
+                folder_data[folder] = (0, [])
             folder_data[folder][1].append((file_idx, link.original_filename))
 
-        # Sort folders by their first sequence number to maintain order
+        # Renumber files within each folder
         for folder in folder_data:
-            folder_data[folder] = (folder_first_seq.get(folder, 0), folder_data[folder][1])
+            sort_key = folder_first_seq.get(folder, 0)
+            file_list = folder_data[folder][1]
+            file_list.sort(key=lambda x: x[0])
+            renumbered = [(i, fname) for i, (_, fname) in enumerate(file_list)]
+            folder_data[folder] = (sort_key, renumbered)
 
-        if not folder_data:
-            return False
-
-        sorted_folders = sorted(folder_data.items(), key=lambda x: x[1][0])
-
+        # Use ordered_folders as the authoritative folder list (includes TRANSITION).
+        # Fall back to folder_data ordering for old sessions without folder_order.
         self.source_folders.clear()
         self.source_list.clear()
         self._folder_trim_settings.clear()
         self._folder_type_overrides.clear()
         self._per_transition_settings.clear()
         self._removed_files.clear()
+        self._direct_transitions.clear()
 
-        for folder, (folder_idx, file_list) in sorted_folders:
-            folder_path = Path(folder)
-            if folder_path.exists():
+        # Build resolved-path lookup for folder_data, db_per_trans_settings,
+        # and db_removed_files.  Symlink source paths in the DB are resolved,
+        # but ordered_folders / per-trans / removed paths may be unresolved
+        # (old sessions) or resolved (new sessions).  We try both forms.
+        def _resolve_lookup(key: str, mapping: dict) -> str | None:
+            """Find key in mapping, trying both raw and resolved forms."""
+            if key in mapping:
+                return key
+            resolved = str(Path(key).resolve())
+            if resolved in mapping:
+                return resolved
+            return None
+
+        if ordered_folders:
+            # New path: ordered_folders has every folder in saved order
+            main_idx = 0
+            seen_resolved: set[str] = set()
+            for folder_str, folder_type, trim_start, trim_end in ordered_folders:
+                folder_path = Path(folder_str)
+                # Resolve symlinks for consistent path matching
+                if not folder_path.exists():
+                    continue
+                folder_path = folder_path.resolve()
+                resolved_str = str(folder_path)
                 self.source_folders.append(folder_path)
-                self.source_list.addItem(folder)
-                if folder in db_trim_settings:
-                    self._folder_trim_settings[folder_path] = db_trim_settings[folder]
-                if folder in db_folder_types and db_folder_types[folder] != FolderType.AUTO:
-                    self._folder_type_overrides[folder_path] = db_folder_types[folder]
-                if folder in db_per_trans_settings:
-                    self._per_transition_settings[folder_path] = db_per_trans_settings[folder]
-                if folder in db_removed_files:
-                    self._removed_files[folder_path] = db_removed_files[folder]
+                self.source_list.addItem(resolved_str)
+                seen_resolved.add(resolved_str)
+                if trim_start > 0 or trim_end > 0:
+                    self._folder_trim_settings[folder_path] = (trim_start, trim_end)
+                if folder_type != FolderType.AUTO:
+                    self._folder_type_overrides[folder_path] = folder_type
+                pts_key = _resolve_lookup(folder_str, db_per_trans_settings)
+                if pts_key is None:
+                    pts_key = _resolve_lookup(resolved_str, db_per_trans_settings)
+                if pts_key is not None:
+                    self._per_transition_settings[folder_path] = db_per_trans_settings[pts_key]
+                rm_key = _resolve_lookup(folder_str, db_removed_files)
+                if rm_key is None:
+                    rm_key = _resolve_lookup(resolved_str, db_removed_files)
+                if rm_key is not None:
+                    self._removed_files[folder_path] = db_removed_files[rm_key]
+                # Assign folder_data index for MAIN folders used by _restore_files_from_session
+                fd_key = _resolve_lookup(folder_str, folder_data)
+                if fd_key is None:
+                    fd_key = _resolve_lookup(resolved_str, folder_data)
+                if fd_key is not None:
+                    folder_data[fd_key] = (main_idx, folder_data[fd_key][1])
+                    main_idx += 1
+
+            # For old sessions, ordered_folders may be incomplete (only folders
+            # with trim/type overrides were saved). Append any symlink-derived
+            # folders that weren't already included, in their original order.
+            sorted_remaining = sorted(
+                [(f, d) for f, d in folder_data.items()
+                 if str(Path(f).resolve()) not in seen_resolved],
+                key=lambda x: x[1][0],
+            )
+            for folder_str, (sort_key, file_list) in sorted_remaining:
+                folder_path = Path(folder_str)
+                if not folder_path.exists():
+                    continue
+                folder_path = folder_path.resolve()
+                resolved_str = str(folder_path)
+                if resolved_str in seen_resolved:
+                    continue
+                seen_resolved.add(resolved_str)
+                self.source_folders.append(folder_path)
+                self.source_list.addItem(resolved_str)
+                folder_data[folder_str] = (main_idx, file_list)
+                main_idx += 1
+                pts_key = _resolve_lookup(resolved_str, db_per_trans_settings)
+                if pts_key is not None:
+                    self._per_transition_settings[folder_path] = db_per_trans_settings[pts_key]
+                rm_key = _resolve_lookup(resolved_str, db_removed_files)
+                if rm_key is not None:
+                    self._removed_files[folder_path] = db_removed_files[rm_key]
+        else:
+            # Legacy path: no ordered_folders, use symlink-derived order
+            sorted_folders = sorted(folder_data.items(), key=lambda x: x[1][0])
+            for actual_idx, (folder, (sort_key, file_list)) in enumerate(sorted_folders):
+                folder_data[folder] = (actual_idx, file_list)
+
+            for folder, (folder_idx, file_list) in sorted(folder_data.items(), key=lambda x: x[1][0]):
+                folder_path = Path(folder)
+                if folder_path.exists():
+                    folder_path = folder_path.resolve()
+                    self.source_folders.append(folder_path)
+                    self.source_list.addItem(str(folder_path))
+                    # Apply trim/type from old DB settings (try both path forms)
+                    settings_key = _resolve_lookup(folder, db_folder_settings)
+                    if settings_key is None:
+                        settings_key = _resolve_lookup(str(folder_path), db_folder_settings)
+                    if settings_key is not None:
+                        ts, te, ft = db_folder_settings[settings_key]
+                        if ts > 0 or te > 0:
+                            self._folder_trim_settings[folder_path] = (ts, te)
+                        if ft != FolderType.AUTO:
+                            self._folder_type_overrides[folder_path] = ft
+                    # Apply per-transition settings
+                    pts_key = _resolve_lookup(folder, db_per_trans_settings)
+                    if pts_key is None:
+                        pts_key = _resolve_lookup(str(folder_path), db_per_trans_settings)
+                    if pts_key is not None:
+                        self._per_transition_settings[folder_path] = db_per_trans_settings[pts_key]
+                    # Apply removed files
+                    rm_key = _resolve_lookup(folder, db_removed_files)
+                    if rm_key is None:
+                        rm_key = _resolve_lookup(str(folder_path), db_removed_files)
+                    if rm_key is not None:
+                        self._removed_files[folder_path] = db_removed_files[rm_key]
+
+        # Restore direct interpolation settings
+        # Build a resolved → actual path lookup for source_folders
+        _resolved_to_folder = {str(f.resolve()): f for f in self.source_folders}
+        for after_folder_str, frame_count, method_str, enabled in db_direct_transitions:
+            after_path = Path(after_folder_str)
+            # Try both raw and resolved forms to find the matching folder
+            matched = None
+            if after_path in self.source_folders:
+                matched = after_path
+            else:
+                resolved = str(after_path.resolve()) if after_path.exists() else after_folder_str
+                if resolved in _resolved_to_folder:
+                    matched = _resolved_to_folder[resolved]
+                elif after_folder_str in _resolved_to_folder:
+                    matched = _resolved_to_folder[after_folder_str]
+            if matched is not None:
+                try:
+                    method = DirectInterpolationMethod(method_str)
+                except ValueError:
+                    method = DirectInterpolationMethod.FILM
+                self._direct_transitions[matched] = DirectTransitionSettings(
+                    after_folder=matched,
+                    frame_count=frame_count,
+                    method=method,
+                    enabled=enabled,
+                )
 
         if db_transition_settings:
             self.transition_group.setChecked(db_transition_settings.enabled)
@@ -2699,7 +3031,8 @@ class SequenceLinkerUI(QWidget):
                 if removed:
                     self._removed_files[folder_path] = removed
 
-        self._current_session_id = latest_session.id
+        self._current_session_id = session.id
+        self._last_resumed_dest = session.destination
 
         self._sync_dual_lists()
         # Restore exact files from session instead of refreshing from disk
@@ -2710,7 +3043,8 @@ class SequenceLinkerUI(QWidget):
         trim_count = sum(1 for ts in self._folder_trim_settings.values() if ts[0] > 0 or ts[1] > 0)
         override_count = len(self._folder_type_overrides)
         per_trans_count = len(self._per_transition_settings)
-        msg = f"Resumed session from {latest_session.created_at.strftime('%Y-%m-%d %H:%M')}.\n"
+        direct_count = len(self._direct_transitions)
+        msg = f"Restored session from {session.created_at.strftime('%Y-%m-%d %H:%M')}.\n"
         msg += f"Loaded {total_files} files from {len(self.source_folders)} folder(s)."
         if trim_count > 0:
             msg += f"\nRestored trim settings for {trim_count} folder(s)."
@@ -2718,6 +3052,8 @@ class SequenceLinkerUI(QWidget):
             msg += f"\nRestored {override_count} folder type override(s)."
         if per_trans_count > 0:
             msg += f"\nRestored {per_trans_count} per-transition overlap setting(s)."
+        if direct_count > 0:
+            msg += f"\nRestored {direct_count} direct interpolation setting(s)."
         removed_count = sum(len(v) for v in self._removed_files.values())
         if db_transition_settings and db_transition_settings.enabled:
             msg += f"\nRestored transition settings."
@@ -2729,7 +3065,10 @@ class SequenceLinkerUI(QWidget):
         if missing_count > 0:
             msg += f"\n{missing_count} file(s) no longer exist and were skipped."
 
-        QMessageBox.information(self, "Session Resumed", msg)
+        if not silent:
+            QMessageBox.information(self, "Session Restored", msg)
+        else:
+            pass  # Silent restore (auto-resume on startup)
         return True
 
     def keyPressEvent(self, event) -> None:
@@ -2762,9 +3101,164 @@ class SequenceLinkerUI(QWidget):
             super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
-        """Clean up media player when window closes."""
+        """Auto-save session state and clean up media player when window closes."""
+        self._auto_save_session()
         self.media_player.stop()
         super().closeEvent(event)
+
+    def _auto_save_session(self) -> None:
+        """Save current state to the database so it can be restored on next launch.
+
+        Creates or updates a session for the current destination path. This runs
+        on close so that folder setup, transition settings, trim, etc. survive
+        even if the user never explicitly exported.
+        """
+        try:
+            if not self.source_folders:
+                return
+
+            dst = self.dst_path.currentText().strip()
+            if not dst:
+                return
+
+            dest = str(Path(dst).resolve())
+
+            # Reuse existing session or create a new one
+            if self._current_session_id is not None:
+                session_id = self._current_session_id
+            else:
+                session_id = self.db.create_session(dest)
+                self._current_session_id = session_id
+
+            # Clear all stale data for this session before re-saving
+            self.db.clear_session_data(session_id)
+
+            self._save_session_settings(session_id, save_effective_types=True)
+
+            # Also save the file list so the exact sequence can be restored
+            files = self._get_files_in_order()
+            if files:
+                for i, (source_dir, filename, folder_idx, file_idx) in enumerate(files):
+                    source_path = source_dir / filename
+                    ext = source_path.suffix
+                    link_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
+                    self.db.record_symlink(
+                        session_id=session_id,
+                        source=str(source_path.resolve()),
+                        link=str(Path(dest) / link_name),
+                        filename=filename,
+                        seq=i,
+                    )
+        except Exception:
+            pass  # Best-effort save on close
+
+    def _save_session(self) -> None:
+        """Explicitly save the current session state (triggered by Save Session button)."""
+        if not self.source_folders:
+            QMessageBox.warning(self, "Nothing to Save", "Add at least one source folder first.")
+            return
+
+        dst = self.dst_path.currentText().strip()
+        if not dst:
+            QMessageBox.warning(self, "No Destination", "Set a destination path first.")
+            return
+
+        dest = str(Path(dst).resolve())
+
+        try:
+            # Always create a fresh session to avoid stale data
+            session_id = self.db.create_session(dest)
+            self._current_session_id = session_id
+
+            self._save_session_settings(session_id, save_effective_types=True)
+
+            # Save the exact file list
+            files = self._get_files_in_order()
+            for i, (source_dir, filename, folder_idx, file_idx) in enumerate(files):
+                source_path = source_dir / filename
+                ext = source_path.suffix
+                link_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
+                self.db.record_symlink(
+                    session_id=session_id,
+                    source=str(source_path.resolve()),
+                    link=str(Path(dest) / link_name),
+                    filename=filename,
+                    seq=i,
+                )
+
+            QMessageBox.information(
+                self, "Session Saved",
+                f"Saved {len(files)} files from {len(self.source_folders)} folders."
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Save Failed", f"Failed to save session:\n{e}")
+
+    def _pick_and_restore_session(self) -> None:
+        """Show a dialog listing saved sessions and restore the selected one."""
+        sessions = self.db.get_sessions()
+        if not sessions:
+            QMessageBox.information(self, "No Sessions", "No saved sessions found.")
+            return
+
+        from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QVBoxLayout, QTreeWidget, QTreeWidgetItem, QHeaderView
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Restore Session")
+        dlg.resize(700, 400)
+
+        layout = QVBoxLayout(dlg)
+
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["Date", "Destination", "Files"])
+        tree.setRootIsDecorated(False)
+        tree.setAlternatingRowColors(True)
+        tree.header().setStretchLastSection(False)
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(tree)
+
+        for s in sessions:
+            date_str = s.created_at.strftime('%Y-%m-%d %H:%M')
+            dest_short = s.destination
+            # Shorten long paths
+            if len(dest_short) > 60:
+                dest_short = '...' + dest_short[-57:]
+            item = QTreeWidgetItem([date_str, dest_short, str(s.link_count)])
+            item.setData(0, Qt.ItemDataRole.UserRole, s)
+            item.setToolTip(1, s.destination)
+            tree.addTopLevelItem(item)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        # Double-click to accept
+        tree.itemDoubleClicked.connect(dlg.accept)
+
+        # Select first item
+        if tree.topLevelItemCount() > 0:
+            tree.setCurrentItem(tree.topLevelItem(0))
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected = tree.currentItem()
+        if not selected:
+            return
+
+        session = selected.data(0, Qt.ItemDataRole.UserRole)
+        if session is None:
+            return
+
+        # Set destination path to match the session
+        self._add_to_path_history(self.dst_path, session.destination)
+
+        self._restore_session_by_id(session)
 
     def wheelEvent(self, event) -> None:
         """Handle mouse wheel for zoom in image tab."""
@@ -2818,11 +3312,27 @@ class SequenceLinkerUI(QWidget):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        """Handle dropped folders."""
+        """Handle dropped folders — insert as TRANSITION when dropped on a placeholder."""
+        # Check if the drop lands on a placeholder item in source_list
+        insert_index = None
+        local_pos = self.source_list.mapFrom(self, event.position().toPoint())
+        target_item = self.source_list.itemAt(local_pos)
+        if target_item is not None and self._is_placeholder_item(target_item):
+            insert_index = self._get_placeholder_insert_index(target_item)
+
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if path and Path(path).is_dir():
-                self._add_source_folder(path)
+                if insert_index is not None:
+                    self._add_source_folder(
+                        path,
+                        folder_type=FolderType.TRANSITION,
+                        insert_index=insert_index,
+                    )
+                    # Only the first dropped folder fills the placeholder slot
+                    insert_index = None
+                else:
+                    self._add_source_folder(path)
 
     def _on_folders_reordered(self) -> None:
         """Handle folder list reordering."""
@@ -2834,6 +3344,18 @@ class SequenceLinkerUI(QWidget):
         """Show context menu for folder type and overlap override."""
         item = self.source_list.itemAt(pos)
         if item is None:
+            return
+
+        # Placeholder item → offer "Add Transition Folder..."
+        if self._is_placeholder_item(item):
+            insert_index = self._get_placeholder_insert_index(item)
+            if insert_index is not None:
+                menu = QMenu(self)
+                add_action = menu.addAction("Add Transition Folder...")
+                add_action.triggered.connect(
+                    lambda: self._add_transition_from_placeholder(insert_index)
+                )
+                menu.exec(self.source_list.mapToGlobal(pos))
             return
 
         folder = item.data(Qt.ItemDataRole.UserRole)
@@ -2938,6 +3460,24 @@ class SequenceLinkerUI(QWidget):
         self._sync_dual_lists()
         self._update_flow_arrows()
 
+    def _add_transition_from_placeholder(self, insert_index: int) -> None:
+        """Open file dialog and insert the chosen folder as a TRANSITION at *insert_index*."""
+        start_dir = self.last_directory or ""
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Transition Folder", start_dir
+        )
+        if path:
+            self._add_source_folder(
+                path, folder_type=FolderType.TRANSITION, insert_index=insert_index
+            )
+
+    def _on_source_item_clicked(self, item: QListWidgetItem) -> None:
+        """Handle click on a source list item — trigger placeholder action if applicable."""
+        if self._is_placeholder_item(item):
+            insert_index = self._get_placeholder_insert_index(item)
+            if insert_index is not None:
+                self._add_transition_from_placeholder(insert_index)
+
     def _get_transition_settings(self) -> TransitionSettings:
         """Get current transition settings from UI."""
         trans_dest = None
@@ -2979,7 +3519,7 @@ class SequenceLinkerUI(QWidget):
             self._folder_file_counts.clear()
             return
 
-        folder_to_index = {folder: i for i, folder in enumerate(self.source_folders)}
+        main_folder_indices = self._get_main_folder_indices()
         all_files = self.manager.get_supported_files(self.source_folders)
 
         files_by_folder: dict[Path, list[str]] = {}
@@ -2994,6 +3534,11 @@ class SequenceLinkerUI(QWidget):
         is_first_folder = True
         for folder in self.source_folders:
             if folder not in files_by_folder:
+                continue
+
+            # Skip transition folders — they only participate in blending,
+            # not in the main image sequence list.
+            if folder not in main_folder_indices:
                 continue
 
             folder_files = files_by_folder[folder]
@@ -3014,7 +3559,7 @@ class SequenceLinkerUI(QWidget):
             if not trimmed_files:
                 continue
 
-            folder_idx = folder_to_index.get(folder, 0)
+            folder_idx = main_folder_indices[folder]
 
             # Add separator between folders (not before first)
             if not is_first_folder:
@@ -3043,6 +3588,7 @@ class SequenceLinkerUI(QWidget):
 
         self._update_trim_slider_for_selected_folder()
         self._update_sequence_table()
+        self._update_export_range_max()
 
     def _restore_files_from_session(
         self,
@@ -3064,6 +3610,9 @@ class SequenceLinkerUI(QWidget):
         self._folder_file_counts = {}
         is_first_folder = True
 
+        # Batch UI updates for performance
+        self.file_list.setUpdatesEnabled(False)
+
         for folder_str, (folder_idx, file_list) in sorted_folders:
             folder_path = Path(folder_str)
             if not folder_path.exists():
@@ -3072,16 +3621,12 @@ class SequenceLinkerUI(QWidget):
             # Sort files by their sequence index
             sorted_files = sorted(file_list, key=lambda x: x[0])
 
-            # Filter to only files that still exist
-            existing_files = [
-                (idx, fname) for idx, fname in sorted_files
-                if (folder_path / fname).exists()
-            ]
-
-            if not existing_files:
+            # Folder existence already verified in _try_resume_session;
+            # only recheck individual files if the folder has changed on disk.
+            if not sorted_files:
                 continue
 
-            self._folder_file_counts[folder_path] = len(existing_files)
+            self._folder_file_counts[folder_path] = len(sorted_files)
 
             # Add separator between folders (not before first)
             if not is_first_folder:
@@ -3089,13 +3634,15 @@ class SequenceLinkerUI(QWidget):
                 self.file_list.addTopLevelItem(separator)
             is_first_folder = False
 
-            for file_idx, filename in existing_files:
+            for file_idx, filename in sorted_files:
                 ext = Path(filename).suffix
                 seq_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
 
                 item = QTreeWidgetItem([seq_name, filename, str(folder_path)])
                 item.setData(0, Qt.ItemDataRole.UserRole, (folder_path, filename, folder_idx, file_idx))
                 self.file_list.addTopLevelItem(item)
+
+        self.file_list.setUpdatesEnabled(True)
 
         total = self.file_list.topLevelItemCount()
         self.image_slider.setRange(0, max(0, total - 1))
@@ -3104,6 +3651,7 @@ class SequenceLinkerUI(QWidget):
 
         self._update_trim_slider_for_selected_folder()
         self._update_sequence_table()
+        self._update_export_range_max()
 
     def _create_folder_separator(self, next_folder_idx: int) -> QTreeWidgetItem:
         """Create a visual separator item between folders."""
@@ -3136,7 +3684,7 @@ class SequenceLinkerUI(QWidget):
         if not self.source_folders:
             return
 
-        folder_to_index = {folder: i for i, folder in enumerate(self.source_folders)}
+        main_folder_indices = self._get_main_folder_indices()
         folder_file_counts: dict[Path, int] = {}
         last_folder_idx = -1
 
@@ -3146,7 +3694,7 @@ class SequenceLinkerUI(QWidget):
             if data:
                 source_dir = data[0]
                 filename = data[1]
-                folder_idx = folder_to_index.get(source_dir, 0)
+                folder_idx = main_folder_indices.get(source_dir, 0)
                 file_idx = folder_file_counts.get(source_dir, 0)
                 folder_file_counts[source_dir] = file_idx + 1
 
@@ -3163,12 +3711,13 @@ class SequenceLinkerUI(QWidget):
                     next_item = self.file_list.topLevelItem(j)
                     next_data = next_item.data(0, Qt.ItemDataRole.UserRole)
                     if next_data:
-                        next_folder_idx = folder_to_index.get(next_data[0], last_folder_idx + 1)
+                        next_folder_idx = main_folder_indices.get(next_data[0], last_folder_idx + 1)
                         break
                 item.setText(1, f"── Sequence {next_folder_idx + 1} ──")
 
         # Update the With Transitions tab to reflect the new order
         self._update_sequence_table()
+        self._update_export_range_max()
 
     # --- Video Preview Methods ---
 
@@ -3185,6 +3734,9 @@ class SequenceLinkerUI(QWidget):
     def _get_folder_from_item(self, item: QListWidgetItem) -> Optional[Path]:
         """Extract folder path from list item."""
         if item is None:
+            return None
+        # Placeholder items have no real folder
+        if self._is_placeholder_item(item):
             return None
         folder = item.data(Qt.ItemDataRole.UserRole)
         if folder is not None:
@@ -3218,6 +3770,10 @@ class SequenceLinkerUI(QWidget):
 
         folder = self._get_folder_from_item(current)
         if folder is None:
+            # Reset trim slider so stale info doesn't linger on placeholders
+            self.trim_slider.setRange(0)
+            self.trim_slider.setEnabled(False)
+            self.trim_label.setText("Frames: No folder selected")
             return
 
         self._update_trim_slider_for_selected_folder()
@@ -3507,6 +4063,27 @@ class SequenceLinkerUI(QWidget):
         """Handle image slider movement."""
         self._show_image_at_index(value)
 
+    def _confirm_overwrite(self, *directories: Path) -> bool:
+        """Check if any directory contains seq_* files and ask the user to confirm."""
+        existing = []
+        for d in directories:
+            if d.is_dir():
+                count = sum(1 for _ in d.glob("seq_*"))
+                if count > 0:
+                    existing.append((d, count))
+        if not existing:
+            return True
+        lines = "\n".join(f"  {d}  ({n} files)" for d, n in existing)
+        reply = QMessageBox.question(
+            self, "Overwrite Existing Files?",
+            f"The following directories already contain exported frames "
+            f"that will be deleted:\n\n{lines}\n\n"
+            f"Continue and replace them?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
     def _export_sequence(self) -> None:
         """Export symlinks only (no transitions), with progress bar."""
         dst = self.dst_path.currentText()
@@ -3527,6 +4104,9 @@ class SequenceLinkerUI(QWidget):
         dest = Path(dst)
         copy_files = self.copy_files_check.isChecked()
 
+        if not self._confirm_overwrite(dest):
+            return
+
         try:
             self.manager.validate_paths(self.source_folders, dest)
             self.manager.cleanup_old_links(dest)
@@ -3534,7 +4114,11 @@ class SequenceLinkerUI(QWidget):
             QMessageBox.critical(self, "Error", str(e))
             return
 
-        session_id = self.db.create_session(str(dest))
+        try:
+            session_id = self.db.create_session(str(dest))
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", f"Failed to create session: {e}")
+            return
         self._current_session_id = session_id
 
         if session_id:
@@ -3552,6 +4136,8 @@ class SequenceLinkerUI(QWidget):
         progress.setWindowTitle("Export Sequence")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
+        progress.setAutoReset(False)
+        progress.setAutoClose(False)
         progress.setValue(0)
 
         successful = 0
@@ -3563,7 +4149,7 @@ class SequenceLinkerUI(QWidget):
 
             source_path = source_dir / filename
             ext = source_path.suffix
-            link_name = f"seq_{i:05d}{ext}"
+            link_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
             link_path = dest / link_name
 
             progress.setLabelText(f"Exporting file {i + 1}/{total}: {filename}")
@@ -3585,7 +4171,7 @@ class SequenceLinkerUI(QWidget):
                     filename=filename,
                     seq=i,
                 )
-            except OSError as e:
+            except Exception as e:
                 errors.append(f"{filename}: {e}")
 
         progress.setValue(total)
@@ -3628,6 +4214,13 @@ class SequenceLinkerUI(QWidget):
             QMessageBox.warning(self, "Error", "No files to process!")
             return
 
+        # Range is applied inside _process_with_transitions on the output
+        # sequence, not on the input file list, because the output includes
+        # blended/interpolated frames whose indices differ from input indices.
+        export_range = None
+        if self.export_options_group.isChecked():
+            export_range = (self.range_start_spin.value(), self.range_end_spin.value())
+
         transition_settings = self._get_transition_settings()
 
         # Use transition destination if specified, otherwise use main destination
@@ -3638,15 +4231,238 @@ class SequenceLinkerUI(QWidget):
         try:
             copy_files = self.copy_files_check.isChecked()
             if len(self.source_folders) >= 2:
-                self._process_with_transitions(Path(dst), trans_dst, files, transition_settings, copy_files)
+                self._process_with_transitions(Path(dst), trans_dst, files, transition_settings, copy_files, export_range)
             else:
                 # Fall back to regular export if less than 2 folders
                 self._export_sequence()
+                return
 
         except SymlinkError as e:
             QMessageBox.critical(self, "Error", str(e))
+            return
         except Exception as e:
             QMessageBox.critical(self, "Unexpected Error", str(e))
+            return
+
+        # Trigger video encoding if enabled — all output is in trans_dest
+        if self.export_options_group.isChecked() and self.video_export_check.isChecked():
+            self._encode_output_video(trans_dst)
+
+    def _update_export_range_max(self) -> None:
+        """Update export range spinbox maximums based on current file count.
+
+        When transitions are enabled, uses the full sequence frame count
+        (including TRANSITION folder middle frames) instead of MAIN-only count.
+        """
+        if self.transition_group.isChecked() and self._sequence_frame_count > 0:
+            total = self._sequence_frame_count
+        else:
+            total = len(self._get_files_in_order())
+        max_val = max(0, total - 1)
+        old_end_max = self.range_end_spin.maximum()
+
+        # Temporarily disconnect to avoid cross-constraint issues
+        self.range_start_spin.blockSignals(True)
+        self.range_end_spin.blockSignals(True)
+
+        self.range_start_spin.setMaximum(max_val)
+        self.range_end_spin.setMaximum(max_val)
+
+        # If end was at old max, snap to new max
+        if self.range_end_spin.value() == old_end_max or self.range_end_spin.value() > max_val:
+            self.range_end_spin.setValue(max_val)
+
+        # Ensure start <= end
+        if self.range_start_spin.value() > self.range_end_spin.value():
+            self.range_start_spin.setValue(self.range_end_spin.value())
+
+        # Re-apply cross constraints
+        self.range_end_spin.setMinimum(self.range_start_spin.value())
+        self.range_start_spin.setMaximum(self.range_end_spin.value())
+
+        self.range_start_spin.blockSignals(False)
+        self.range_end_spin.blockSignals(False)
+
+    def _reset_export_range(self) -> None:
+        """Reset export range to cover all frames."""
+        if self.transition_group.isChecked() and self._sequence_frame_count > 0:
+            total = self._sequence_frame_count
+        else:
+            total = len(self._get_files_in_order())
+        max_val = max(0, total - 1)
+
+        self.range_start_spin.blockSignals(True)
+        self.range_end_spin.blockSignals(True)
+
+        self.range_start_spin.setMinimum(0)
+        self.range_start_spin.setMaximum(max_val)
+        self.range_end_spin.setMinimum(0)
+        self.range_end_spin.setMaximum(max_val)
+
+        self.range_start_spin.setValue(0)
+        self.range_end_spin.setValue(max_val)
+
+        self.range_start_spin.blockSignals(False)
+        self.range_end_spin.blockSignals(False)
+
+    def _encode_video_only(self) -> None:
+        """Encode video from exported seq_* files, or directly from source images."""
+        if not find_ffmpeg():
+            QMessageBox.warning(
+                self, "ffmpeg Not Found",
+                "ffmpeg is not installed or not found in PATH.\n"
+                "Install ffmpeg to use video encoding."
+            )
+            return
+
+        dst = self.dst_path.currentText().strip()
+        dst_dir = Path(dst) if dst else None
+
+        # Check transition destination first (Export with Transitions writes there),
+        # then fall back to main destination (Export Sequence writes there).
+        trans_dst = self.trans_dst_path.currentText().strip()
+        trans_dst_dir = Path(trans_dst) if trans_dst else None
+
+        encode_dir = None
+        if trans_dst_dir is not None and trans_dst_dir.is_dir() and any(trans_dst_dir.glob("seq_*")):
+            encode_dir = trans_dst_dir
+        elif dst_dir is not None and dst_dir.is_dir() and any(dst_dir.glob("seq_*")):
+            encode_dir = dst_dir
+
+        if encode_dir is not None:
+            self._encode_output_video(encode_dir)
+        else:
+            # Encode directly from the current file list (no prior export needed)
+            files = self._get_files_in_order()
+            if not files:
+                QMessageBox.warning(self, "Error", "No files in the sequence to encode!")
+                return
+
+            # Apply export range if set
+            if self.export_options_group.isChecked():
+                start = self.range_start_spin.value()
+                end = self.range_end_spin.value()
+                files = files[start:end + 1]
+
+            file_paths = [source_dir / filename for source_dir, filename, _, _ in files]
+
+            preset_key = self.video_preset_combo.currentData()
+            if preset_key is None:
+                return
+            preset = VIDEO_PRESETS[preset_key]
+            fps = self.fps_spin.value()
+
+            # Ask where to save the video
+            default_name = f"output.{preset.container}"
+            save_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Video", default_name,
+                f"Video (*.{preset.container})"
+            )
+            if not save_path:
+                return
+
+            output_path = Path(save_path)
+            total_frames = len(file_paths)
+
+            progress = QProgressDialog("Encoding video...", "Cancel", 0, total_frames, self)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+
+            cancelled = False
+
+            def on_progress(current: int, total: int) -> bool:
+                nonlocal cancelled
+                progress.setValue(current)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    return False
+                return True
+
+            success, message = encode_from_file_list(
+                file_paths=file_paths,
+                output_path=output_path,
+                fps=fps,
+                preset=preset,
+                progress_callback=on_progress,
+            )
+
+            progress.close()
+
+            if success:
+                QMessageBox.information(
+                    self, "Video Encoded",
+                    f"Video saved to:\n{message}"
+                )
+            elif not cancelled:
+                QMessageBox.critical(
+                    self, "Encoding Failed",
+                    f"Video encoding failed:\n{message}"
+                )
+
+    def _encode_output_video(self, output_dir: Path) -> None:
+        """Encode the exported image sequence to video using ffmpeg."""
+        if not find_ffmpeg():
+            QMessageBox.warning(
+                self, "ffmpeg Not Found",
+                "ffmpeg is not installed or not found in PATH.\n"
+                "Install ffmpeg to use video encoding."
+            )
+            return
+
+        preset_key = self.video_preset_combo.currentData()
+        if preset_key is None:
+            return
+        preset = VIDEO_PRESETS[preset_key]
+        fps = self.fps_spin.value()
+
+        # Count seq_* files and detect extension
+        seq_files = sorted(output_dir.glob("seq_*"))
+        if not seq_files:
+            QMessageBox.warning(self, "No Frames", "No seq_* files found in output directory.")
+            return
+        total_frames = len(seq_files)
+
+        output_path = output_dir / f"output.{preset.container}"
+
+        progress = QProgressDialog("Encoding video...", "Cancel", 0, total_frames, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        cancelled = False
+
+        def on_progress(current: int, total: int) -> bool:
+            nonlocal cancelled
+            progress.setValue(current)
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled = True
+                return False
+            return True
+
+        success, message = encode_image_sequence(
+            input_dir=output_dir,
+            output_path=output_path,
+            fps=fps,
+            preset=preset,
+            progress_callback=on_progress,
+            total_frames=total_frames,
+        )
+
+        progress.close()
+
+        if success:
+            QMessageBox.information(
+                self, "Video Encoded",
+                f"Video saved to:\n{message}"
+            )
+        elif not cancelled:
+            QMessageBox.critical(
+                self, "Encoding Failed",
+                f"Video encoding failed:\n{message}"
+            )
 
     def _save_session_settings(self, session_id: int, save_effective_types: bool = False) -> None:
         """Save transition settings and folder type overrides to database.
@@ -3661,25 +4477,39 @@ class SequenceLinkerUI(QWidget):
 
         for folder_idx, folder in enumerate(self.source_folders):
             trim_start, trim_end = self._folder_trim_settings.get(folder, (0, 0))
+            # Always use resolved path so it matches symlink source paths in DB
+            resolved_folder = str(folder.resolve())
             if save_effective_types:
                 # Save effective type so restore doesn't rely on index-based auto-detection
                 effective_type = self._get_effective_folder_type(folder_idx, folder)
                 self.db.save_trim_settings(
-                    session_id, str(folder), trim_start, trim_end, effective_type
+                    session_id, resolved_folder, trim_start, trim_end, effective_type,
+                    folder_order=folder_idx,
                 )
             else:
                 folder_type = self._folder_type_overrides.get(folder, FolderType.AUTO)
-                if trim_start > 0 or trim_end > 0 or folder_type != FolderType.AUTO:
-                    self.db.save_trim_settings(
-                        session_id, str(folder), trim_start, trim_end, folder_type
-                    )
+                self.db.save_trim_settings(
+                    session_id, resolved_folder, trim_start, trim_end, folder_type,
+                    folder_order=folder_idx,
+                )
 
         for folder, pts in self._per_transition_settings.items():
-            self.db.save_per_transition_settings(session_id, pts)
+            # Use resolved path so it matches folder paths in other tables
+            resolved_pts = PerTransitionSettings(
+                trans_folder=folder.resolve(),
+                left_overlap=pts.left_overlap,
+                right_overlap=pts.right_overlap,
+            )
+            self.db.save_per_transition_settings(session_id, resolved_pts)
 
         for folder, removed in self._removed_files.items():
             if removed:
-                self.db.save_removed_files(session_id, str(folder), list(removed))
+                self.db.save_removed_files(session_id, str(folder.resolve()), list(removed))
+
+        for folder, dt in self._direct_transitions.items():
+            self.db.save_direct_transition(
+                session_id, str(folder.resolve()), dt.frame_count, dt.method.value, dt.enabled
+            )
 
     def _process_with_transitions(
         self,
@@ -3687,16 +4517,28 @@ class SequenceLinkerUI(QWidget):
         trans_dest: Path,
         files: list[tuple],
         settings: TransitionSettings,
-        copy_files: bool = False
+        copy_files: bool = False,
+        export_range: Optional[tuple[int, int]] = None,
     ) -> None:
-        """Process files with cross-dissolve transitions."""
-        self.manager.validate_paths(self.source_folders, symlink_dest)
-        self.manager.cleanup_old_links(symlink_dest)
+        """Process files with cross-dissolve transitions.
 
-        # Also clean transition destination if different
-        if trans_dest != symlink_dest:
-            trans_dest.mkdir(parents=True, exist_ok=True)
-            self.manager.cleanup_old_links(trans_dest)
+        All output (symlinks/copies AND blended frames) goes to trans_dest so
+        that the main destination's Export Sequence files are never touched.
+
+        Args:
+            symlink_dest: Main destination (used only for validation/session).
+            trans_dest: Where all transition output files are written.
+            export_range: Optional (start, end) output frame range. Only output
+                frames whose sequence number falls within this range are written.
+        """
+        self.manager.validate_paths(self.source_folders, symlink_dest)
+
+        # Only clean and overwrite in trans_dest — never touch symlink_dest's seq* files
+        trans_dest.mkdir(parents=True, exist_ok=True)
+        if not self._confirm_overwrite(trans_dest):
+            return
+
+        self.manager.cleanup_old_links(trans_dest)
 
         session_id = self.db.create_session(str(symlink_dest))
         self._current_session_id = session_id
@@ -3707,6 +4549,15 @@ class SequenceLinkerUI(QWidget):
             if source_dir not in files_by_folder:
                 files_by_folder[source_dir] = []
             files_by_folder[source_dir].append(filename)
+
+        # Include TRANSITION folder files (not in file_list but needed for blending)
+        for idx, folder in enumerate(self.source_folders):
+            if folder not in files_by_folder:
+                ft = self._get_effective_folder_type(idx, folder)
+                if ft == FolderType.TRANSITION:
+                    trans_files = self.manager.get_supported_files([folder])
+                    if trans_files:
+                        files_by_folder[folder] = [f for _, f in trans_files]
 
         generator = TransitionGenerator(settings)
 
@@ -3723,7 +4574,26 @@ class SequenceLinkerUI(QWidget):
             trans_at_main_end[trans.main_folder] = trans
             trans_at_trans_start[trans.trans_folder] = trans
 
+        # Build transition boundary summary for the completion dialog
+        boundary_notes: list[str] = []
+        for trans in transitions:
+            main_count = len(trans.main_files)
+            trans_count = len(trans.trans_files)
+            capped = ""
+            if trans.left_overlap < 16 or trans.right_overlap < 16:
+                parts = []
+                if trans.left_overlap < 16:
+                    parts.append(f"{trans.main_folder.name} has {main_count} files")
+                if trans.right_overlap < 16:
+                    parts.append(f"{trans.trans_folder.name} has {trans_count} files")
+                capped = f" (capped: {', '.join(parts)})"
+            boundary_notes.append(
+                f"  {trans.main_folder.name} -> {trans.trans_folder.name}: "
+                f"{trans.left_overlap}/{trans.right_overlap} overlap{capped}"
+            )
+
         # Count total files including direct interpolation frames
+        # Include all folders — TRANSITION folders contribute middle (non-overlap) frames
         total_files = sum(len(f) for f in files_by_folder.values())
         for folder, direct_settings in self._direct_transitions.items():
             if direct_settings.enabled:
@@ -3733,12 +4603,15 @@ class SequenceLinkerUI(QWidget):
         progress.setWindowTitle("Cross-Dissolve Generation")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
+        progress.setAutoReset(False)
+        progress.setAutoClose(False)
         progress.setValue(0)
 
         current_op = 0
         output_seq = 0
         symlink_count = 0
         blend_count = 0
+        blend_skipped_range = 0
         errors = []
 
         num_folders = len(self.source_folders)
@@ -3780,7 +4653,7 @@ class SequenceLinkerUI(QWidget):
                         blend_trans = trans_at_end
                         blend_idx_in_overlap = file_idx - main_overlap_start
 
-                if trans_at_start:
+                if trans_at_start and not should_blend:
                     right_overlap = trans_at_start.right_overlap
                     if file_idx < right_overlap:
                         should_skip = True
@@ -3788,69 +4661,79 @@ class SequenceLinkerUI(QWidget):
                         progress.setValue(current_op)
                         continue
 
+                # Check if this output frame is within the export range
+                in_range = (
+                    export_range is None
+                    or (export_range[0] <= output_seq <= export_range[1])
+                )
+
                 if should_blend and blend_trans:
-                    # Generate asymmetric blend frame
-                    output_count = max(blend_trans.left_overlap, blend_trans.right_overlap)
+                    if in_range:
+                        # Generate asymmetric blend frame
+                        output_count = max(blend_trans.left_overlap, blend_trans.right_overlap)
 
-                    # Calculate positions
-                    t = blend_idx_in_overlap / (output_count - 1) if output_count > 1 else 0
+                        # Calculate positions
+                        t = blend_idx_in_overlap / (output_count - 1) if output_count > 1 else 0
 
-                    # Get main frame
-                    main_path = source_path
+                        # Get main frame
+                        main_path = source_path
 
-                    # Get trans frame position
-                    trans_pos = t * (blend_trans.right_overlap - 1) if blend_trans.right_overlap > 1 else 0
-                    trans_idx = int(trans_pos)
-                    trans_idx = min(trans_idx, blend_trans.right_overlap - 1)
-                    trans_file = blend_trans.trans_files[trans_idx]
-                    trans_path = blend_trans.trans_folder / trans_file
+                        # Get trans frame position
+                        trans_pos = t * (blend_trans.right_overlap - 1) if blend_trans.right_overlap > 1 else 0
+                        trans_idx = int(trans_pos)
+                        trans_idx = min(trans_idx, blend_trans.right_overlap - 1)
+                        trans_file = blend_trans.trans_files[trans_idx]
+                        trans_path = blend_trans.trans_folder / trans_file
 
-                    factor = generator.blender.calculate_blend_factor(
-                        blend_idx_in_overlap, output_count, settings.blend_curve
-                    )
-
-                    ext = f".{settings.output_format.lower()}"
-                    output_name = f"seq_{output_seq:05d}{ext}"
-                    output_path = trans_dest / output_name
-
-                    result = generator.blender.blend_images(
-                        main_path, trans_path, factor,
-                        output_path, settings.output_format,
-                        settings.output_quality, settings.webp_method,
-                        settings.blend_method, settings.rife_binary_path,
-                        settings.rife_model, settings.rife_uhd, settings.rife_tta,
-                        settings.practical_rife_model, settings.practical_rife_ensemble
-                    )
-
-                    if result.success:
-                        blend_count += 1
-                        self.db.record_symlink(
-                            session_id, str(main_path.resolve()),
-                            str(output_path), filename, output_seq
+                        factor = generator.blender.calculate_blend_factor(
+                            blend_idx_in_overlap, output_count, settings.blend_curve
                         )
+
+                        ext = f".{settings.output_format.lower()}"
+                        output_name = f"seq_{output_seq:05d}{ext}"
+                        output_path = trans_dest / output_name
+
+                        result = generator.blender.blend_images(
+                            main_path, trans_path, factor,
+                            output_path, settings.output_format,
+                            settings.output_quality, settings.webp_method,
+                            settings.blend_method, settings.rife_binary_path,
+                            settings.rife_model, settings.rife_uhd, settings.rife_tta,
+                            settings.practical_rife_model, settings.practical_rife_ensemble
+                        )
+
+                        if result.success:
+                            blend_count += 1
+                            self.db.record_symlink(
+                                session_id, str(main_path.resolve()),
+                                str(output_path), filename, output_seq
+                            )
+                        else:
+                            errors.append(f"Blend {filename}: {result.error}")
                     else:
-                        errors.append(f"Blend {filename}: {result.error}")
+                        blend_skipped_range += 1
 
                     output_seq += 1
                 else:
-                    ext = source_path.suffix
-                    link_name = f"seq_{output_seq:05d}{ext}"
-                    link_path = symlink_dest / link_name
+                    if in_range:
+                        ext = source_path.suffix
+                        link_name = f"seq_{output_seq:05d}{ext}"
+                        link_path = trans_dest / link_name
 
-                    try:
-                        if copy_files:
-                            import shutil
-                            shutil.copy2(source_path, link_path)
-                        else:
-                            rel_source = Path(os.path.relpath(source_path.resolve(), symlink_dest.resolve()))
-                            link_path.symlink_to(rel_source)
-                        symlink_count += 1
-                        self.db.record_symlink(
-                            session_id, str(source_path.resolve()),
-                            str(link_path), filename, output_seq
-                        )
-                    except OSError as e:
-                        errors.append(f"Symlink {filename}: {e}")
+                        try:
+                            if copy_files:
+                                import shutil
+                                shutil.copy2(source_path, link_path)
+                            else:
+                                rel_source = Path(os.path.relpath(source_path.resolve(), trans_dest.resolve()))
+                                link_path.symlink_to(rel_source)
+                            symlink_count += 1
+                            self.db.record_symlink(
+                                session_id, str(source_path.resolve()),
+                                str(link_path), filename, output_seq
+                            )
+                        except Exception as e:
+                            errors.append(f"Symlink {filename}: {e}")
 
                     output_seq += 1
 
@@ -3870,39 +4753,49 @@ class SequenceLinkerUI(QWidget):
                             # Get last frame of current folder and first of next
                             last_frame = folder / folder_files[-1]
                             first_frame = next_folder / next_files[0]
+                            batch_end = output_seq + direct_settings.frame_count - 1
 
-                            progress.setLabelText(
-                                f"Generating {direct_settings.method.value.upper()} frames..."
+                            # Check if any frame in this batch falls within the range
+                            batch_in_range = (
+                                export_range is None
+                                or (output_seq <= export_range[1] and batch_end >= export_range[0])
                             )
 
-                            # Generate direct interpolation frames
-                            direct_results = generator.generate_direct_interpolation_frames(
-                                last_frame,
-                                first_frame,
-                                direct_settings.frame_count,
-                                direct_settings.method,
-                                trans_dest,
-                                folder_idx,
-                                output_seq,
-                                settings.practical_rife_model,
-                                settings.practical_rife_ensemble
-                            )
+                            if batch_in_range:
+                                progress.setLabelText(
+                                    f"Generating {direct_settings.method.value.upper()} frames..."
+                                )
 
-                            for result in direct_results:
-                                if result.success:
-                                    blend_count += 1
-                                    self.db.record_symlink(
-                                        session_id,
-                                        str(result.source_a.resolve()),
-                                        str(result.output_path),
-                                        result.output_path.name,
-                                        output_seq
-                                    )
-                                else:
-                                    errors.append(
-                                        f"Direct interp {result.output_path.name}: {result.error}"
-                                    )
-                                output_seq += 1
+                                # Generate direct interpolation frames
+                                direct_results = generator.generate_direct_interpolation_frames(
+                                    last_frame,
+                                    first_frame,
+                                    direct_settings.frame_count,
+                                    direct_settings.method,
+                                    trans_dest,
+                                    folder_idx,
+                                    output_seq,
+                                    settings.practical_rife_model,
+                                    settings.practical_rife_ensemble
+                                )
+
+                                for result in direct_results:
+                                    if result.success:
+                                        blend_count += 1
+                                        self.db.record_symlink(
+                                            session_id,
+                                            str(result.source_a.resolve()),
+                                            str(result.output_path),
+                                            result.output_path.name,
+                                            output_seq
+                                        )
+                                    else:
+                                        errors.append(
+                                            f"Direct interp {result.output_path.name}: {result.error}"
+                                        )
+                                    output_seq += 1
+                            else:
+                                output_seq += direct_settings.frame_count
 
                             progress.setLabelText(
                                 f"Processing folder {folder_idx + 1}/{num_folders}: {folder_label}..."
@@ -3911,11 +4804,16 @@ class SequenceLinkerUI(QWidget):
         progress.close()
 
         link_type = "copies" if copy_files else "symlinks"
+        range_note = ""
+        if blend_skipped_range > 0:
+            range_note = f"\n({blend_skipped_range} blends outside export range)"
+
         if progress.wasCanceled():
             QMessageBox.warning(
                 self, "Canceled",
                 f"Operation canceled.\n"
                 f"Created {symlink_count} {link_type}, {blend_count} blended frames."
+                f"{range_note}"
             )
         elif errors:
             QMessageBox.warning(
@@ -3923,13 +4821,13 @@ class SequenceLinkerUI(QWidget):
                 f"Created {symlink_count} {link_type}, {blend_count} blended frames.\n"
                 f"{len(errors)} errors occurred.\n"
                 f"First error: {errors[0] if errors else 'N/A'}\n"
-                f"{link_type.title()}: {symlink_dest}\n"
-                f"Blends: {trans_dest}"
+                f"Output: {trans_dest}"
+                f"{range_note}"
             )
         else:
             QMessageBox.information(
                 self, "Success",
                 f"Created {symlink_count} {link_type} and {blend_count} blended frames.\n"
-                f"{link_type.title()}: {symlink_dest}\n"
-                f"Blends: {trans_dest}"
+                f"Output: {trans_dest}"
+                f"{range_note}"
             )

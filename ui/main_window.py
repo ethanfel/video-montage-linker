@@ -451,8 +451,7 @@ class SequenceLinkerUI(QWidget):
         """Create all UI widgets."""
         # Source folders panel - side panel with single unified list
         self.source_panel = QWidget()
-        self.source_panel.setMinimumWidth(250)
-        self.source_panel.setMaximumWidth(400)
+        self.source_panel.setMinimumWidth(150)
 
         # Single unified source list (odd=Main, even=Transition)
         self.source_list = QListWidget()
@@ -1008,6 +1007,7 @@ class SequenceLinkerUI(QWidget):
         self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.content_splitter.addWidget(file_list_panel)
         self.content_splitter.addWidget(self.preview_tabs)
+        self.content_splitter.setHandleWidth(5)
         self.content_splitter.setSizes([350, 450])
 
         # Export buttons layout
@@ -1048,6 +1048,7 @@ class SequenceLinkerUI(QWidget):
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.addWidget(self.source_panel)
         self.main_splitter.addWidget(right_panel)
+        self.main_splitter.setHandleWidth(5)
         self.main_splitter.setSizes([250, 750])
         self.main_splitter.setStretchFactor(0, 0)  # Source panel doesn't stretch
         self.main_splitter.setStretchFactor(1, 1)  # Main content stretches

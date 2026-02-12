@@ -216,6 +216,31 @@ class DatabaseManager:
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to record symlink: {e}") from e
 
+    def record_symlinks_batch(
+        self,
+        session_id: int,
+        records: list[tuple[str, str, str, int]],
+    ) -> None:
+        """Record multiple symlinks in a single transaction.
+
+        Args:
+            session_id: The session these symlinks belong to.
+            records: List of (source, link, filename, seq) tuples.
+
+        Raises:
+            DatabaseError: If recording fails.
+        """
+        try:
+            with self._connect() as conn:
+                conn.executemany(
+                    """INSERT INTO symlinks
+                       (session_id, source_path, link_path, original_filename, sequence_number)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [(session_id, src, lnk, fname, seq) for src, lnk, fname, seq in records]
+                )
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to record symlinks: {e}") from e
+
     def get_sessions(self) -> list[SessionRecord]:
         """List all sessions with link counts.
 

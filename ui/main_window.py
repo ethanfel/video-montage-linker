@@ -3166,17 +3166,18 @@ class SequenceLinkerUI(QWidget):
             self._save_session_settings(session_id, save_effective_types=True)
 
             # Save the file list so the exact sequence can be restored
+            records = []
             for i, (source_dir, filename, folder_idx, file_idx) in enumerate(files):
                 source_path = source_dir / filename
                 ext = source_path.suffix
                 link_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
-                self.db.record_symlink(
-                    session_id=session_id,
-                    source=str(source_path.resolve()),
-                    link=str(Path(dest) / link_name),
-                    filename=filename,
-                    seq=i,
-                )
+                records.append((
+                    str(source_path.resolve()),
+                    str(Path(dest) / link_name),
+                    filename,
+                    i,
+                ))
+            self.db.record_symlinks_batch(session_id, records)
         except Exception:
             pass  # Best-effort save on close
 
@@ -3200,19 +3201,20 @@ class SequenceLinkerUI(QWidget):
 
             self._save_session_settings(session_id, save_effective_types=True)
 
-            # Save the exact file list
+            # Save the exact file list in a single transaction
             files = self._get_files_in_order()
+            records = []
             for i, (source_dir, filename, folder_idx, file_idx) in enumerate(files):
                 source_path = source_dir / filename
                 ext = source_path.suffix
                 link_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
-                self.db.record_symlink(
-                    session_id=session_id,
-                    source=str(source_path.resolve()),
-                    link=str(Path(dest) / link_name),
-                    filename=filename,
-                    seq=i,
-                )
+                records.append((
+                    str(source_path.resolve()),
+                    str(Path(dest) / link_name),
+                    filename,
+                    i,
+                ))
+            self.db.record_symlinks_batch(session_id, records)
 
             main_count = sum(
                 1 for i, f in enumerate(self.source_folders)
@@ -3667,8 +3669,11 @@ class SequenceLinkerUI(QWidget):
             # Sort files by their sequence index
             sorted_files = sorted(file_list, key=lambda x: x[0])
 
-            # Folder existence already verified in _try_resume_session;
-            # only recheck individual files if the folder has changed on disk.
+            # Filter out individually removed files
+            removed = self._removed_files.get(folder_path, set())
+            if removed:
+                sorted_files = [(idx, fname) for idx, fname in sorted_files if fname not in removed]
+
             if not sorted_files:
                 continue
 

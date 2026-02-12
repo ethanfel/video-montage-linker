@@ -96,6 +96,7 @@ class TimelineTreeWidget(QTreeWidget):
             if first_item:
                 # Get column positions
                 col0_width = self.columnWidth(0)
+                col1_right = col0_width + self.columnWidth(1)
                 viewport_width = self.viewport().width()
 
                 # Font for time labels
@@ -134,8 +135,8 @@ class TimelineTreeWidget(QTreeWidget):
                         # Draw time label on right of column 0
                         painter.drawText(col0_width - text_width - 6, y_center + metrics.ascent() // 2, time_str)
 
-                        # Draw time label on right of column 1 (right edge)
-                        painter.drawText(viewport_width - text_width - 6, y_center + metrics.ascent() // 2, time_str)
+                        # Draw time label on right of column 1 (before the # column)
+                        painter.drawText(col1_right - text_width - 6, y_center + metrics.ascent() // 2, time_str)
 
         painter.end()
 

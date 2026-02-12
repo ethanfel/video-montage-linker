@@ -4266,8 +4266,11 @@ class SequenceLinkerUI(QWidget):
         progress.setAutoClose(False)
         progress.setValue(0)
 
+        import shutil
+
         successful = 0
         errors = []
+        symlink_records = []
 
         for i, (source_dir, filename, folder_idx, file_idx) in enumerate(files):
             if progress.wasCanceled():
@@ -4278,27 +4281,35 @@ class SequenceLinkerUI(QWidget):
             link_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
             link_path = dest / link_name
 
-            progress.setLabelText(f"Exporting file {i + 1}/{total}: {filename}")
+            # Throttle UI updates — label text changes are expensive
+            if i % 10 == 0:
+                progress.setLabelText(f"Exporting file {i + 1}/{total}: {filename}")
             progress.setValue(i)
+            QApplication.processEvents()
 
             try:
                 if copy_files:
-                    import shutil
                     shutil.copy2(source_path, link_path)
                 else:
                     rel_source = Path(os.path.relpath(source_path.resolve(), dest.resolve()))
                     link_path.symlink_to(rel_source)
 
                 successful += 1
-                self.db.record_symlink(
-                    session_id=session_id,
-                    source=str(source_path.resolve()),
-                    link=str(link_path),
-                    filename=filename,
-                    seq=i,
-                )
+                symlink_records.append((
+                    str(source_path.resolve()),
+                    str(link_path),
+                    filename,
+                    i,
+                ))
             except Exception as e:
                 errors.append(f"{filename}: {e}")
+
+        # Batch DB insert — one transaction instead of per-file connections
+        if symlink_records:
+            try:
+                self.db.record_symlinks_batch(session_id, symlink_records)
+            except Exception:
+                pass  # Don't fail the export over DB recording
 
         progress.setValue(total)
         progress.close()
@@ -4733,12 +4744,15 @@ class SequenceLinkerUI(QWidget):
         progress.setAutoClose(False)
         progress.setValue(0)
 
+        import shutil
+
         current_op = 0
         output_seq = 0
         symlink_count = 0
         blend_count = 0
         blend_skipped_range = 0
         errors = []
+        symlink_records = []
 
         num_folders = len(self.source_folders)
 
@@ -4830,10 +4844,10 @@ class SequenceLinkerUI(QWidget):
 
                         if result.success:
                             blend_count += 1
-                            self.db.record_symlink(
-                                session_id, str(main_path.resolve()),
+                            symlink_records.append((
+                                str(main_path.resolve()),
                                 str(output_path), filename, output_seq
-                            )
+                            ))
                         else:
                             errors.append(f"Blend {filename}: {result.error}")
                     else:
@@ -4848,16 +4862,15 @@ class SequenceLinkerUI(QWidget):
 
                         try:
                             if copy_files:
-                                import shutil
                                 shutil.copy2(source_path, link_path)
                             else:
                                 rel_source = Path(os.path.relpath(source_path.resolve(), trans_dest.resolve()))
                                 link_path.symlink_to(rel_source)
                             symlink_count += 1
-                            self.db.record_symlink(
-                                session_id, str(source_path.resolve()),
+                            symlink_records.append((
+                                str(source_path.resolve()),
                                 str(link_path), filename, output_seq
-                            )
+                            ))
                         except Exception as e:
                             errors.append(f"Symlink {filename}: {e}")
 
@@ -4865,6 +4878,7 @@ class SequenceLinkerUI(QWidget):
 
                 current_op += 1
                 progress.setValue(current_op)
+                QApplication.processEvents()
 
             # Check for direct interpolation after this folder
             if folder in self._direct_transitions:
@@ -4908,13 +4922,12 @@ class SequenceLinkerUI(QWidget):
                                 for result in direct_results:
                                     if result.success:
                                         blend_count += 1
-                                        self.db.record_symlink(
-                                            session_id,
+                                        symlink_records.append((
                                             str(result.source_a.resolve()),
                                             str(result.output_path),
                                             result.output_path.name,
                                             output_seq
-                                        )
+                                        ))
                                     else:
                                         errors.append(
                                             f"Direct interp {result.output_path.name}: {result.error}"
@@ -4926,6 +4939,13 @@ class SequenceLinkerUI(QWidget):
                             progress.setLabelText(
                                 f"Processing folder {folder_idx + 1}/{num_folders}: {folder_label}..."
                             )
+
+        # Batch DB insert — one transaction instead of per-file connections
+        if symlink_records:
+            try:
+                self.db.record_symlinks_batch(session_id, symlink_records)
+            except Exception:
+                pass  # Don't fail the export over DB recording
 
         progress.close()
 

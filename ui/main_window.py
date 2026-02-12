@@ -1008,6 +1008,7 @@ class SequenceLinkerUI(QWidget):
         self.content_splitter.addWidget(file_list_panel)
         self.content_splitter.addWidget(self.preview_tabs)
         self.content_splitter.setHandleWidth(5)
+        self.content_splitter.setChildrenCollapsible(False)
         self.content_splitter.setSizes([350, 450])
 
         # Export buttons layout
@@ -1045,10 +1046,12 @@ class SequenceLinkerUI(QWidget):
         right_layout.addWidget(self.export_options_group)
 
         # === MAIN SPLITTER: Source Panel | Main Content ===
+        right_panel.setMinimumWidth(400)
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.addWidget(self.source_panel)
         self.main_splitter.addWidget(right_panel)
         self.main_splitter.setHandleWidth(5)
+        self.main_splitter.setChildrenCollapsible(False)
         self.main_splitter.setSizes([250, 750])
         self.main_splitter.setStretchFactor(0, 0)  # Source panel doesn't stretch
         self.main_splitter.setStretchFactor(1, 1)  # Main content stretches

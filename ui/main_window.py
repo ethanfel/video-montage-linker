@@ -500,10 +500,14 @@ class SequenceLinkerUI(QWidget):
         self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.file_list.setRootIsDecorated(False)
         self.file_list.header().setStretchLastSection(False)
-        self.file_list.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.file_list.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.file_list.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.file_list.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.file_list.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.file_list.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.file_list.header().setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        self.file_list.header().resizeSection(0, 120)
+        self.file_list.header().resizeSection(2, 150)
+        self.file_list.header().resizeSection(3, 50)
+        self.file_list.header().setMinimumSectionSize(40)
         self.file_list.setToolTip("Drag to reorder within folder, Del to remove")
 
         # Action buttons
@@ -642,7 +646,9 @@ class SequenceLinkerUI(QWidget):
         self.sequence_table.header().setStretchLastSection(False)
         self.sequence_table.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.sequence_table.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.sequence_table.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.sequence_table.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.sequence_table.header().resizeSection(2, 50)
+        self.sequence_table.header().setMinimumSectionSize(40)
 
         # Cross-dissolve transition settings group - horizontal layout
         self.transition_group = QGroupBox("Cross-Dissolve Transitions")

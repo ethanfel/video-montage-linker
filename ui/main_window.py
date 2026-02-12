@@ -644,9 +644,10 @@ class SequenceLinkerUI(QWidget):
         self.sequence_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.sequence_table.setAlternatingRowColors(True)
         self.sequence_table.header().setStretchLastSection(False)
-        self.sequence_table.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.sequence_table.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.sequence_table.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.sequence_table.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.sequence_table.header().resizeSection(0, 200)
         self.sequence_table.header().resizeSection(2, 50)
         self.sequence_table.header().setMinimumSectionSize(40)
 
@@ -1005,6 +1006,10 @@ class SequenceLinkerUI(QWidget):
         file_list_layout.addLayout(btn_layout)
 
         # Splitter for file list and preview tabs
+        file_list_panel.setMinimumWidth(200)
+        self.preview_tabs.setMinimumWidth(200)
+        file_list_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.preview_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.content_splitter.addWidget(file_list_panel)
         self.content_splitter.addWidget(self.preview_tabs)
@@ -3061,11 +3066,7 @@ class SequenceLinkerUI(QWidget):
                 self._add_to_path_history(self.trans_dst_path, str(db_transition_settings.trans_destination))
             if db_transition_settings.rife_binary_path:
                 self.rife_path_input.setText(str(db_transition_settings.rife_binary_path))
-            # Restore optical flow settings
-            for i in range(self.of_preset_combo.count()):
-                if self.of_preset_combo.itemData(i) == db_transition_settings.of_preset:
-                    self.of_preset_combo.setCurrentIndex(i)
-                    break
+            # OF preset is not restored from session — the widget default (Max) always applies
             self.of_levels_spin.setValue(db_transition_settings.of_levels)
             self.of_winsize_spin.setValue(db_transition_settings.of_winsize)
             self.of_iterations_spin.setValue(db_transition_settings.of_iterations)

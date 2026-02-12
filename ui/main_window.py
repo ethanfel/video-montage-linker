@@ -1048,14 +1048,14 @@ class SequenceLinkerUI(QWidget):
 
         # === MAIN SPLITTER: Source Panel | Main Content ===
         right_panel.setMinimumWidth(400)
+        self.source_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.addWidget(self.source_panel)
         self.main_splitter.addWidget(right_panel)
         self.main_splitter.setHandleWidth(5)
         self.main_splitter.setChildrenCollapsible(False)
         self.main_splitter.setSizes([250, 750])
-        self.main_splitter.setStretchFactor(0, 0)  # Source panel doesn't stretch
-        self.main_splitter.setStretchFactor(1, 1)  # Main content stretches
 
         # Main layout
         main_layout = QVBoxLayout()

@@ -3285,7 +3285,10 @@ class SequenceLinkerUI(QWidget):
             QMessageBox.information(self, "No Sessions", "No saved sessions found.")
             return
 
-        from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QVBoxLayout, QTreeWidget, QTreeWidgetItem, QHeaderView
+        from PyQt6.QtWidgets import (
+            QDialog, QDialogButtonBox, QVBoxLayout, QHBoxLayout,
+            QTreeWidget, QTreeWidgetItem, QHeaderView, QPushButton,
+        )
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Restore Session")
@@ -3297,36 +3300,71 @@ class SequenceLinkerUI(QWidget):
         tree.setHeaderLabels(["Date", "Destination", "Files"])
         tree.setRootIsDecorated(False)
         tree.setAlternatingRowColors(True)
+        tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         tree.header().setStretchLastSection(False)
         tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(tree)
 
-        for s in sessions:
-            date_str = s.created_at.strftime('%Y-%m-%d %H:%M')
-            dest_short = s.destination
-            # Shorten long paths
-            if len(dest_short) > 60:
-                dest_short = '...' + dest_short[-57:]
-            item = QTreeWidgetItem([date_str, dest_short, str(s.link_count)])
-            item.setData(0, Qt.ItemDataRole.UserRole, s)
-            item.setToolTip(1, s.destination)
-            tree.addTopLevelItem(item)
+        def populate_tree():
+            tree.clear()
+            for s in self.db.get_sessions():
+                date_str = s.created_at.strftime('%Y-%m-%d %H:%M')
+                dest_short = s.destination
+                if len(dest_short) > 60:
+                    dest_short = '...' + dest_short[-57:]
+                item = QTreeWidgetItem([date_str, dest_short, str(s.link_count)])
+                item.setData(0, Qt.ItemDataRole.UserRole, s)
+                item.setToolTip(1, s.destination)
+                tree.addTopLevelItem(item)
+            if tree.topLevelItemCount() > 0:
+                tree.setCurrentItem(tree.topLevelItem(0))
+
+        def delete_selected():
+            selected_items = tree.selectedItems()
+            if not selected_items:
+                return
+            count = len(selected_items)
+            label = "session" if count == 1 else "sessions"
+            reply = QMessageBox.question(
+                dlg, "Delete Sessions",
+                f"Delete {count} {label}? This cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            ids = []
+            for item in selected_items:
+                s = item.data(0, Qt.ItemDataRole.UserRole)
+                if s is not None:
+                    ids.append(s.id)
+            if ids:
+                try:
+                    self.db.delete_sessions(ids)
+                except Exception as e:
+                    QMessageBox.critical(dlg, "Error", f"Failed to delete:\n{e}")
+                    return
+            populate_tree()
+
+        populate_tree()
+
+        btn_layout = QHBoxLayout()
+        delete_btn = QPushButton("Delete Selected")
+        delete_btn.clicked.connect(delete_selected)
+        btn_layout.addWidget(delete_btn)
+        btn_layout.addStretch()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
-        layout.addWidget(buttons)
+        btn_layout.addWidget(buttons)
+        layout.addLayout(btn_layout)
 
         # Double-click to accept
         tree.itemDoubleClicked.connect(dlg.accept)
-
-        # Select first item
-        if tree.topLevelItemCount() > 0:
-            tree.setCurrentItem(tree.topLevelItem(0))
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return

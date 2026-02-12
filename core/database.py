@@ -331,7 +331,7 @@ class DatabaseManager:
         ]
 
     def delete_session(self, session_id: int) -> None:
-        """Delete a session and all its symlink records.
+        """Delete a session and all its related data (CASCADE handles child tables).
 
         Args:
             session_id: The session ID to delete.
@@ -341,10 +341,30 @@ class DatabaseManager:
         """
         try:
             with self._connect() as conn:
-                conn.execute("DELETE FROM symlinks WHERE session_id = ?", (session_id,))
                 conn.execute("DELETE FROM symlink_sessions WHERE id = ?", (session_id,))
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to delete session: {e}") from e
+
+    def delete_sessions(self, session_ids: list[int]) -> None:
+        """Delete multiple sessions in a single transaction.
+
+        Args:
+            session_ids: List of session IDs to delete.
+
+        Raises:
+            DatabaseError: If deletion fails.
+        """
+        if not session_ids:
+            return
+        try:
+            with self._connect() as conn:
+                placeholders = ','.join('?' for _ in session_ids)
+                conn.execute(
+                    f"DELETE FROM symlink_sessions WHERE id IN ({placeholders})",
+                    session_ids
+                )
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to delete sessions: {e}") from e
 
     def get_sessions_by_destination(self, dest: str) -> list[SessionRecord]:
         """Get all sessions for a destination directory.

@@ -2560,6 +2560,52 @@ class SequenceLinkerUI(QWidget):
 
         self._update_flow_arrows()
 
+    def _replace_source_folder(self, old_folder: Path, idx: int) -> None:
+        """Replace a source folder with a new one, preserving edits.
+
+        Keeps: folder type override, trim settings, per-transition settings,
+        removed files set, direct transition settings, and position in list.
+        """
+        start_dir = str(old_folder.parent) if old_folder.exists() else (self.last_directory or "")
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Replacement Folder", start_dir
+        )
+        if not path:
+            return
+
+        new_folder = Path(path).resolve()
+        if new_folder == old_folder:
+            return
+        if new_folder in self.source_folders:
+            QMessageBox.warning(self, "Duplicate", "That folder is already in the list.")
+            return
+
+        # Migrate all settings from old path to new path
+        self.source_folders[idx] = new_folder
+
+        if old_folder in self._folder_type_overrides:
+            self._folder_type_overrides[new_folder] = self._folder_type_overrides.pop(old_folder)
+        if old_folder in self._folder_trim_settings:
+            self._folder_trim_settings[new_folder] = self._folder_trim_settings.pop(old_folder)
+        if old_folder in self._per_transition_settings:
+            pts = self._per_transition_settings.pop(old_folder)
+            self._per_transition_settings[new_folder] = PerTransitionSettings(
+                trans_folder=new_folder,
+                left_overlap=pts.left_overlap,
+                right_overlap=pts.right_overlap,
+            )
+        if old_folder in self._removed_files:
+            self._removed_files[new_folder] = self._removed_files.pop(old_folder)
+        if old_folder in self._direct_transitions:
+            self._direct_transitions[new_folder] = self._direct_transitions.pop(old_folder)
+        if old_folder in self._folder_file_counts:
+            del self._folder_file_counts[old_folder]
+
+        self.last_directory = str(new_folder.parent)
+        self._sync_dual_lists()
+        self._refresh_files()
+        self._update_flow_arrows()
+
     def _remove_files_from_folder(self, folder: Path) -> None:
         """Remove all files from a specific folder without affecting order of other files."""
         folder_str = str(folder)
@@ -3430,6 +3476,9 @@ class SequenceLinkerUI(QWidget):
         if effective_type == FolderType.TRANSITION:
             overlap_action = menu.addAction("Set Overlap Frames...")
             overlap_action.triggered.connect(lambda: self._show_overlap_dialog(folder))
+
+        replace_action = menu.addAction("Replace Folder...")
+        replace_action.triggered.connect(lambda: self._replace_source_folder(folder, idx))
 
         menu.exec(self.source_list.mapToGlobal(pos))
 

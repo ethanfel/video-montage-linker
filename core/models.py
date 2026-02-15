@@ -103,6 +103,7 @@ VIDEO_PRESETS: dict[str, VideoPreset] = {
     'fast_preview':   VideoPreset('Fast Preview',    'mp4',  'libx264',    28, preset='ultrafast'),
     'webm_vp9':       VideoPreset('WebM VP9',        'webm', 'libvpx-vp9', 30, extra_args=['-b:v', '0']),
     'webm_av1':       VideoPreset('WebM AV1',        'webm', 'libaom-av1', 30, extra_args=['-b:v', '0', '-strict', 'experimental']),
+    'godot_theora':   VideoPreset('Godot (Theora)',   'ogv',  'libtheora',   8, extra_args=['-g', '512']),
 }
 
 
@@ -129,6 +130,9 @@ class TransitionSpec:
     # Indices into the overall file list
     main_start_idx: int
     trans_start_idx: int
+    # Position indices in the folders list (for duplicate folder support)
+    main_folder_idx: int = 0
+    trans_folder_idx: int = 0
 
 
 @dataclass
@@ -160,6 +164,7 @@ class SessionRecord:
     created_at: datetime
     destination: str
     link_count: int = 0
+    name: Optional[str] = None
 
 
 # --- Exceptions ---

@@ -65,7 +65,7 @@ def encode_image_sequence(
         '-framerate', str(fps),
         '-i', str(input_dir / input_pattern),
         '-c:v', preset.codec,
-        '-crf', str(preset.crf),
+        '-q:v' if preset.codec == 'libtheora' else '-crf', str(preset.crf),
         '-pix_fmt', preset.pixel_format,
     ]
 
@@ -198,7 +198,7 @@ def encode_from_file_list(
         '-f', 'concat', '-safe', '0',
         '-i', str(concat_path),
         '-c:v', preset.codec,
-        '-crf', str(preset.crf),
+        '-q:v' if preset.codec == 'libtheora' else '-crf', str(preset.crf),
         '-pix_fmt', preset.pixel_format,
     ]
 

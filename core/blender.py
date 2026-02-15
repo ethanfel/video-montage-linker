@@ -1356,21 +1356,19 @@ class TransitionGenerator:
     def get_folder_type(
         self,
         index: int,
-        overrides: Optional[dict[Path, FolderType]] = None,
-        folder: Optional[Path] = None
+        overrides: Optional[dict[int, FolderType]] = None,
     ) -> FolderType:
         """Determine folder type based on position or override.
 
         Args:
             index: 0-based position of folder in list.
-            overrides: Optional dict of folder path to FolderType overrides.
-            folder: The folder path for checking overrides.
+            overrides: Optional dict of position index to FolderType overrides.
 
         Returns:
-            FolderType.MAIN for odd positions (1, 3, 5...), TRANSITION for even.
+            FolderType.MAIN for even positions (0, 2, 4...), TRANSITION for odd.
         """
-        if overrides and folder and folder in overrides:
-            override = overrides[folder]
+        if overrides and index in overrides:
+            override = overrides[index]
             if override != FolderType.AUTO:
                 return override
 
@@ -1380,9 +1378,9 @@ class TransitionGenerator:
     def identify_transition_boundaries(
         self,
         folders: list[Path],
-        files_by_folder: dict[Path, list[str]],
-        folder_overrides: Optional[dict[Path, FolderType]] = None,
-        per_transition_settings: Optional[dict[Path, PerTransitionSettings]] = None
+        files_by_idx: dict[int, list[str]],
+        folder_overrides: Optional[dict[int, FolderType]] = None,
+        per_transition_settings: Optional[dict[int, PerTransitionSettings]] = None
     ) -> list[TransitionSpec]:
         """Identify boundaries where transitions should occur.
 
@@ -1391,9 +1389,9 @@ class TransitionGenerator:
 
         Args:
             folders: List of folders in order.
-            files_by_folder: Dict mapping folders to their file lists.
-            folder_overrides: Optional folder type overrides.
-            per_transition_settings: Optional per-transition overlap settings.
+            files_by_idx: Dict mapping position index to file lists.
+            folder_overrides: Optional position-index-keyed folder type overrides.
+            per_transition_settings: Optional position-index-keyed per-transition overlap settings.
 
         Returns:
             List of TransitionSpec objects describing each transition.
@@ -1403,33 +1401,33 @@ class TransitionGenerator:
 
         transitions = []
         cumulative_idx = 0
-        folder_start_indices = {}
+        folder_start_indices: dict[int, int] = {}
 
-        # Calculate start indices for each folder
-        for folder in folders:
-            folder_start_indices[folder] = cumulative_idx
-            cumulative_idx += len(files_by_folder.get(folder, []))
+        # Calculate start indices for each folder position
+        for i in range(len(folders)):
+            folder_start_indices[i] = cumulative_idx
+            cumulative_idx += len(files_by_idx.get(i, []))
 
         # Look for transition boundaries (MAIN->TRANSITION and TRANSITION->MAIN)
         for i in range(len(folders) - 1):
             folder_a = folders[i]
             folder_b = folders[i + 1]
 
-            type_a = self.get_folder_type(i, folder_overrides, folder_a)
-            type_b = self.get_folder_type(i + 1, folder_overrides, folder_b)
+            type_a = self.get_folder_type(i, folder_overrides)
+            type_b = self.get_folder_type(i + 1, folder_overrides)
 
             # Create transition when types differ (MAIN->TRANS or TRANS->MAIN)
             if type_a != type_b:
-                files_a = files_by_folder.get(folder_a, [])
-                files_b = files_by_folder.get(folder_b, [])
+                files_a = files_by_idx.get(i, [])
+                files_b = files_by_idx.get(i + 1, [])
 
                 if not files_a or not files_b:
                     continue
 
                 # Get per-transition overlap settings if available
-                # Use folder_b as the key (the "incoming" folder)
-                if per_transition_settings and folder_b in per_transition_settings:
-                    pts = per_transition_settings[folder_b]
+                # Use i+1 as the key (the "incoming" folder position)
+                if per_transition_settings and (i + 1) in per_transition_settings:
+                    pts = per_transition_settings[i + 1]
                     left_overlap = pts.left_overlap
                     right_overlap = pts.right_overlap
                 else:
@@ -1451,8 +1449,10 @@ class TransitionGenerator:
                     trans_files=files_b,
                     left_overlap=left_overlap,
                     right_overlap=right_overlap,
-                    main_start_idx=folder_start_indices[folder_a],
-                    trans_start_idx=folder_start_indices[folder_b]
+                    main_start_idx=folder_start_indices[i],
+                    trans_start_idx=folder_start_indices[i + 1],
+                    main_folder_idx=i,
+                    trans_folder_idx=i + 1,
                 ))
 
         return transitions

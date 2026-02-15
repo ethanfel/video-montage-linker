@@ -39,7 +39,8 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS symlink_sessions (
                     id INTEGER PRIMARY KEY,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    destination TEXT NOT NULL
+                    destination TEXT NOT NULL,
+                    name TEXT DEFAULT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS symlinks (
@@ -138,8 +139,131 @@ class DatabaseManager:
             except sqlite3.OperationalError:
                 conn.execute("ALTER TABLE sequence_trim_settings ADD COLUMN folder_order INTEGER DEFAULT 0")
 
+            # Migration: add name column to symlink_sessions if it doesn't exist
+            try:
+                conn.execute("SELECT name FROM symlink_sessions LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE symlink_sessions ADD COLUMN name TEXT DEFAULT NULL")
+
+            # Migration: widen UNIQUE constraints to allow duplicate folder paths per session.
+            # sequence_trim_settings: UNIQUE(session_id, source_folder) → UNIQUE(session_id, folder_order)
+            self._migrate_unique_constraint(
+                conn, 'sequence_trim_settings',
+                """CREATE TABLE sequence_trim_settings_new (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER REFERENCES symlink_sessions(id) ON DELETE CASCADE,
+                    source_folder TEXT NOT NULL,
+                    trim_start INTEGER DEFAULT 0,
+                    trim_end INTEGER DEFAULT 0,
+                    folder_type TEXT DEFAULT 'auto',
+                    folder_order INTEGER DEFAULT 0,
+                    UNIQUE(session_id, folder_order)
+                )""",
+                'session_id, source_folder, trim_start, trim_end, folder_type, folder_order',
+            )
+
+            # per_transition_settings: add folder_order, widen UNIQUE
+            try:
+                conn.execute("SELECT folder_order FROM per_transition_settings LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE per_transition_settings ADD COLUMN folder_order INTEGER DEFAULT 0")
+            self._migrate_unique_constraint(
+                conn, 'per_transition_settings',
+                """CREATE TABLE per_transition_settings_new (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER REFERENCES symlink_sessions(id) ON DELETE CASCADE,
+                    trans_folder TEXT NOT NULL,
+                    left_overlap INTEGER DEFAULT 16,
+                    right_overlap INTEGER DEFAULT 16,
+                    folder_order INTEGER DEFAULT 0,
+                    UNIQUE(session_id, trans_folder, folder_order)
+                )""",
+                'session_id, trans_folder, left_overlap, right_overlap, folder_order',
+            )
+
+            # removed_files: add folder_order, widen UNIQUE
+            try:
+                conn.execute("SELECT folder_order FROM removed_files LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE removed_files ADD COLUMN folder_order INTEGER DEFAULT 0")
+            self._migrate_unique_constraint(
+                conn, 'removed_files',
+                """CREATE TABLE removed_files_new (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER REFERENCES symlink_sessions(id) ON DELETE CASCADE,
+                    source_folder TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    folder_order INTEGER DEFAULT 0,
+                    UNIQUE(session_id, source_folder, filename, folder_order)
+                )""",
+                'session_id, source_folder, filename, folder_order',
+            )
+
+            # direct_transition_settings: add folder_order, widen UNIQUE
+            try:
+                conn.execute("SELECT folder_order FROM direct_transition_settings LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE direct_transition_settings ADD COLUMN folder_order INTEGER DEFAULT 0")
+            self._migrate_unique_constraint(
+                conn, 'direct_transition_settings',
+                """CREATE TABLE direct_transition_settings_new (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER REFERENCES symlink_sessions(id) ON DELETE CASCADE,
+                    after_folder TEXT NOT NULL,
+                    frame_count INTEGER DEFAULT 16,
+                    method TEXT DEFAULT 'film',
+                    enabled INTEGER DEFAULT 1,
+                    folder_order INTEGER DEFAULT 0,
+                    UNIQUE(session_id, after_folder, folder_order)
+                )""",
+                'session_id, after_folder, frame_count, method, enabled, folder_order',
+            )
+
             # Migration: remove overlap_frames from transition_settings (now per-transition)
             # We'll keep it for backward compatibility but won't use it
+
+    @staticmethod
+    def _migrate_unique_constraint(
+        conn: sqlite3.Connection,
+        table: str,
+        create_new_sql: str,
+        columns: str,
+    ) -> None:
+        """Recreate a table with a new UNIQUE constraint if needed.
+
+        Tests whether duplicate folder_order=0 entries can be inserted.
+        If an IntegrityError fires, the old constraint is too narrow and
+        the table must be recreated.
+        """
+        new_table = f"{table}_new"
+        try:
+            # Test: can we insert two rows with same session+folder but different folder_order?
+            # If the old UNIQUE is still (session_id, source_folder) this will fail.
+            conn.execute(f"INSERT INTO {table} (session_id, {columns.split(',')[1].strip()}, folder_order) VALUES (-999, '__test__', 1)")
+            conn.execute(f"INSERT INTO {table} (session_id, {columns.split(',')[1].strip()}, folder_order) VALUES (-999, '__test__', 2)")
+            # Clean up test rows
+            conn.execute(f"DELETE FROM {table} WHERE session_id = -999")
+            # If we got here, the constraint already allows duplicates — no migration needed
+            return
+        except sqlite3.IntegrityError:
+            # Old constraint is too narrow — need to recreate
+            conn.execute(f"DELETE FROM {table} WHERE session_id = -999")
+        except sqlite3.OperationalError:
+            # Column might not exist yet or other issue — try migration anyway
+            conn.execute(f"DELETE FROM {table} WHERE session_id = -999")
+
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {new_table}")
+            conn.execute(create_new_sql)
+            conn.execute(f"INSERT INTO {new_table} ({columns}) SELECT {columns} FROM {table}")
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(f"ALTER TABLE {new_table} RENAME TO {table}")
+        except (sqlite3.OperationalError, sqlite3.IntegrityError):
+            # Clean up failed migration attempt
+            try:
+                conn.execute(f"DROP TABLE IF EXISTS {new_table}")
+            except sqlite3.OperationalError:
+                pass
 
     def clear_session_data(self, session_id: int) -> None:
         """Delete all data for a session (symlinks, settings, etc.) but keep the session row."""
@@ -159,11 +283,12 @@ class DatabaseManager:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
-    def create_session(self, destination: str) -> int:
+    def create_session(self, destination: str, name: Optional[str] = None) -> int:
         """Create a new linking session.
 
         Args:
             destination: The destination directory path.
+            name: Optional display name (e.g. "autosave").
 
         Returns:
             The ID of the created session.
@@ -174,8 +299,8 @@ class DatabaseManager:
         try:
             with self._connect() as conn:
                 cursor = conn.execute(
-                    "INSERT INTO symlink_sessions (destination) VALUES (?)",
-                    (destination,)
+                    "INSERT INTO symlink_sessions (destination, name) VALUES (?, ?)",
+                    (destination, name)
                 )
                 return cursor.lastrowid
         except sqlite3.Error as e:
@@ -249,7 +374,7 @@ class DatabaseManager:
         """
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT s.id, s.created_at, s.destination, COUNT(l.id) as link_count
+                SELECT s.id, s.created_at, s.destination, COUNT(l.id) as link_count, s.name
                 FROM symlink_sessions s
                 LEFT JOIN symlinks l ON s.id = l.session_id
                 GROUP BY s.id
@@ -261,7 +386,8 @@ class DatabaseManager:
                 id=row[0],
                 created_at=datetime.fromisoformat(row[1]),
                 destination=row[2],
-                link_count=row[3]
+                link_count=row[3],
+                name=row[4]
             )
             for row in rows
         ]
@@ -377,7 +503,7 @@ class DatabaseManager:
         """
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT s.id, s.created_at, s.destination, COUNT(l.id) as link_count
+                SELECT s.id, s.created_at, s.destination, COUNT(l.id) as link_count, s.name
                 FROM symlink_sessions s
                 LEFT JOIN symlinks l ON s.id = l.session_id
                 WHERE s.destination = ?
@@ -390,7 +516,8 @@ class DatabaseManager:
                 id=row[0],
                 created_at=datetime.fromisoformat(row[1]),
                 destination=row[2],
-                link_count=row[3]
+                link_count=row[3],
+                name=row[4]
             )
             for row in rows
         ]
@@ -423,11 +550,11 @@ class DatabaseManager:
                     """INSERT INTO sequence_trim_settings
                        (session_id, source_folder, trim_start, trim_end, folder_type, folder_order)
                        VALUES (?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(session_id, source_folder)
-                       DO UPDATE SET trim_start=excluded.trim_start,
+                       ON CONFLICT(session_id, folder_order)
+                       DO UPDATE SET source_folder=excluded.source_folder,
+                                     trim_start=excluded.trim_start,
                                      trim_end=excluded.trim_end,
-                                     folder_type=excluded.folder_type,
-                                     folder_order=excluded.folder_order""",
+                                     folder_type=excluded.folder_type""",
                     (session_id, source_folder, trim_start, trim_end, folder_type.value, folder_order)
                 )
         except sqlite3.Error as e:
@@ -672,13 +799,15 @@ class DatabaseManager:
     def save_per_transition_settings(
         self,
         session_id: int,
-        settings: PerTransitionSettings
+        settings: PerTransitionSettings,
+        folder_order: int = 0,
     ) -> None:
         """Save per-transition overlap settings.
 
         Args:
             session_id: The session ID.
             settings: PerTransitionSettings to save.
+            folder_order: Position of this folder in the source list.
 
         Raises:
             DatabaseError: If saving fails.
@@ -687,13 +816,14 @@ class DatabaseManager:
             with self._connect() as conn:
                 conn.execute(
                     """INSERT INTO per_transition_settings
-                       (session_id, trans_folder, left_overlap, right_overlap)
-                       VALUES (?, ?, ?, ?)
-                       ON CONFLICT(session_id, trans_folder)
-                       DO UPDATE SET left_overlap=excluded.left_overlap,
+                       (session_id, trans_folder, left_overlap, right_overlap, folder_order)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(session_id, folder_order)
+                       DO UPDATE SET trans_folder=excluded.trans_folder,
+                                     left_overlap=excluded.left_overlap,
                                      right_overlap=excluded.right_overlap""",
                     (session_id, str(settings.trans_folder),
-                     settings.left_overlap, settings.right_overlap)
+                     settings.left_overlap, settings.right_overlap, folder_order)
                 )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to save per-transition settings: {e}") from e
@@ -730,36 +860,31 @@ class DatabaseManager:
     def get_all_per_transition_settings(
         self,
         session_id: int
-    ) -> dict[str, PerTransitionSettings]:
+    ) -> list[tuple[str, int, int, int]]:
         """Get all per-transition settings for a session.
 
         Args:
             session_id: The session ID.
 
         Returns:
-            Dict mapping transition folder paths to PerTransitionSettings.
+            List of (trans_folder, left_overlap, right_overlap, folder_order) tuples.
         """
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT trans_folder, left_overlap, right_overlap
-                   FROM per_transition_settings WHERE session_id = ?""",
+                """SELECT trans_folder, left_overlap, right_overlap, folder_order
+                   FROM per_transition_settings WHERE session_id = ?
+                   ORDER BY folder_order""",
                 (session_id,)
             ).fetchall()
 
-        return {
-            row[0]: PerTransitionSettings(
-                trans_folder=Path(row[0]),
-                left_overlap=row[1],
-                right_overlap=row[2]
-            )
-            for row in rows
-        }
+        return [(row[0], row[1], row[2], row[3]) for row in rows]
 
     def save_removed_files(
         self,
         session_id: int,
         source_folder: str,
-        filenames: list[str]
+        filenames: list[str],
+        folder_order: int = 0,
     ) -> None:
         """Save removed files for a folder in a session.
 
@@ -767,39 +892,40 @@ class DatabaseManager:
             session_id: The session ID.
             source_folder: Path to the source folder.
             filenames: List of removed filenames.
+            folder_order: Position of this folder in the source list.
         """
         try:
             with self._connect() as conn:
                 for filename in filenames:
                     conn.execute(
                         """INSERT OR IGNORE INTO removed_files
-                           (session_id, source_folder, filename)
-                           VALUES (?, ?, ?)""",
-                        (session_id, source_folder, filename)
+                           (session_id, source_folder, filename, folder_order)
+                           VALUES (?, ?, ?, ?)""",
+                        (session_id, source_folder, filename, folder_order)
                     )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to save removed files: {e}") from e
 
-    def get_removed_files(self, session_id: int) -> dict[str, set[str]]:
-        """Get all removed files for a session.
+    def get_removed_files(self, session_id: int) -> dict[int, set[str]]:
+        """Get all removed files for a session, keyed by folder_order.
 
         Args:
             session_id: The session ID.
 
         Returns:
-            Dict mapping source folder paths to sets of removed filenames.
+            Dict mapping folder_order to sets of removed filenames.
         """
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT source_folder, filename FROM removed_files WHERE session_id = ?",
+                "SELECT source_folder, filename, folder_order FROM removed_files WHERE session_id = ?",
                 (session_id,)
             ).fetchall()
 
-        result: dict[str, set[str]] = {}
-        for folder, filename in rows:
-            if folder not in result:
-                result[folder] = set()
-            result[folder].add(filename)
+        result: dict[int, set[str]] = {}
+        for folder, filename, folder_order in rows:
+            if folder_order not in result:
+                result[folder_order] = set()
+            result[folder_order].add(filename)
         return result
 
     def save_direct_transition(
@@ -809,33 +935,35 @@ class DatabaseManager:
         frame_count: int,
         method: str,
         enabled: bool,
+        folder_order: int = 0,
     ) -> None:
         """Save direct interpolation settings for a folder transition."""
         try:
             with self._connect() as conn:
                 conn.execute(
                     """INSERT INTO direct_transition_settings
-                       (session_id, after_folder, frame_count, method, enabled)
-                       VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(session_id, after_folder)
-                       DO UPDATE SET frame_count=excluded.frame_count,
+                       (session_id, after_folder, frame_count, method, enabled, folder_order)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(session_id, folder_order)
+                       DO UPDATE SET after_folder=excluded.after_folder,
+                                     frame_count=excluded.frame_count,
                                      method=excluded.method,
                                      enabled=excluded.enabled""",
-                    (session_id, after_folder, frame_count, method, 1 if enabled else 0)
+                    (session_id, after_folder, frame_count, method, 1 if enabled else 0, folder_order)
                 )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to save direct transition: {e}") from e
 
-    def get_direct_transitions(self, session_id: int) -> list[tuple[str, int, str, bool]]:
+    def get_direct_transitions(self, session_id: int) -> list[tuple[str, int, str, bool, int]]:
         """Get direct interpolation settings for a session.
 
         Returns:
-            List of (after_folder, frame_count, method, enabled) tuples.
+            List of (after_folder, frame_count, method, enabled, folder_order) tuples.
         """
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT after_folder, frame_count, method, enabled "
+                "SELECT after_folder, frame_count, method, enabled, folder_order "
                 "FROM direct_transition_settings WHERE session_id = ?",
                 (session_id,)
             ).fetchall()
-        return [(r[0], r[1], r[2], bool(r[3])) for r in rows]
+        return [(r[0], r[1], r[2], bool(r[3]), r[4]) for r in rows]

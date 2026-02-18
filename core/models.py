@@ -68,10 +68,10 @@ class TransitionSettings:
 
 @dataclass
 class PerTransitionSettings:
-    """Per-transition overlap settings for asymmetric cross-dissolves."""
+    """Per-transition overlap settings for cross-dissolves."""
     trans_folder: Path
-    left_overlap: int = 16   # frames from main folder end
-    right_overlap: int = 16  # frames from trans folder start
+    left_overlap: int = 16   # overlap count at left boundary (MAIN→TRANS)
+    right_overlap: int = 16  # overlap count at right boundary (TRANS→MAIN)
 
 
 @dataclass

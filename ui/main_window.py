@@ -172,22 +172,22 @@ class OverlapDialog(QDialog):
         self.left_spin = QSpinBox()
         self.left_spin.setRange(1, 120)
         self.left_spin.setValue(left_overlap)
-        self.left_spin.setToolTip("Frames consumed from the end of the Main folder")
-        form_layout.addRow("Left overlap (Main end):", self.left_spin)
+        self.left_spin.setToolTip("Overlap frames at the Main → Transition boundary")
+        form_layout.addRow("Left boundary overlap:", self.left_spin)
 
         self.right_spin = QSpinBox()
         self.right_spin.setRange(1, 120)
         self.right_spin.setValue(right_overlap)
-        self.right_spin.setToolTip("Frames consumed from the start of the Transition folder")
-        form_layout.addRow("Right overlap (Trans start):", self.right_spin)
+        self.right_spin.setToolTip("Overlap frames at the Transition → Main boundary")
+        form_layout.addRow("Right boundary overlap:", self.right_spin)
 
         layout.addLayout(form_layout)
 
         # Explanation
         explain = QLabel(
-            "Left overlap: frames from Main folder end that are blended.\n"
-            "Right overlap: frames from Transition folder start that are blended.\n"
-            "Output frames = max(left, right). Asymmetric values interpolate."
+            "Left: overlap frames at the Main → Trans boundary.\n"
+            "Right: overlap frames at the Trans → Main boundary.\n"
+            "Each side blends that many frames from both folders."
         )
         explain.setStyleSheet("color: gray; font-size: 10px;")
         explain.setWordWrap(True)
@@ -1144,6 +1144,7 @@ class SequenceLinkerUI(QWidget):
 
         # Trim slider signals
         self.trim_slider.trimChanged.connect(self._on_trim_changed)
+        self.trim_slider.trimDragFinished.connect(self._on_trim_drag_finished)
 
         # Format combo change - show/hide quality/method widgets
         self.blend_format_combo.currentIndexChanged.connect(self._on_format_changed)
@@ -1611,6 +1612,14 @@ class SequenceLinkerUI(QWidget):
                          if item.is_file() and item.suffix.lower() in SUPPORTED_EXTENSIONS],
                         key=str.lower
                     )
+                    # Apply trim settings to transition folders
+                    fid = self._folder_ids[idx]
+                    ts, te = self._folder_trim_settings.get(fid, (0, 0))
+                    if ts > 0 or te > 0:
+                        total_t = len(trans_files)
+                        ts = min(ts, max(0, total_t - 1))
+                        te = min(te, max(0, total_t - 1 - ts))
+                        trans_files = trans_files[ts:total_t - te]
                     if trans_files:
                         files_by_idx[idx] = trans_files
 
@@ -1621,6 +1630,7 @@ class SequenceLinkerUI(QWidget):
                 seq_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}"
                 item = QTreeWidgetItem([f"{seq_name} ({filename})", "", str(frame_num)])
                 item.setData(0, Qt.ItemDataRole.UserRole, (source_dir, filename, folder_idx, file_idx, 'symlink'))
+                item.setData(0, Qt.ItemDataRole.UserRole + 2, _fid)
                 self.sequence_table.addTopLevelItem(item)
             self._sequence_frame_count = len(files)
             self.sequence_table.setUpdatesEnabled(True)
@@ -1708,7 +1718,7 @@ class SequenceLinkerUI(QWidget):
                     output_count = max(blend_trans.left_overlap, blend_trans.right_overlap)
                     t = blend_idx_in_overlap / (output_count - 1) if output_count > 1 else 0
                     trans_pos = t * (blend_trans.right_overlap - 1) if blend_trans.right_overlap > 1 else 0
-                    trans_idx = min(int(trans_pos), blend_trans.right_overlap - 1)
+                    trans_idx = min(round(trans_pos), blend_trans.right_overlap - 1)
                     trans_file = blend_trans.trans_files[trans_idx]
 
                     # Outgoing frame with [B] marker, incoming frame with arrow
@@ -1734,6 +1744,7 @@ class SequenceLinkerUI(QWidget):
                     item.setData(0, Qt.ItemDataRole.UserRole, (folder, filename, folder_idx, file_idx, 'symlink', output_seq))
                     output_seq += 1
 
+                item.setData(0, Qt.ItemDataRole.UserRole + 2, self._folder_ids[folder_idx])
                 self.sequence_table.addTopLevelItem(item)
 
             # Check if this folder starts a direct interpolation gap
@@ -1822,6 +1833,11 @@ class SequenceLinkerUI(QWidget):
                 frame_index = data[2]
                 self._show_direct_interpolation_preview(after_fid, frame_index)
                 return
+
+        # Sync source list selection so the trim slider shows this frame's folder
+        fid = current.data(0, Qt.ItemDataRole.UserRole + 2)
+        if fid is not None:
+            self._select_folder_in_lists(fid)
 
         frame_type = data[4] if len(data) > 4 else 'symlink'
 
@@ -3197,6 +3213,13 @@ class SequenceLinkerUI(QWidget):
         else:
             # Restore exact files from session instead of refreshing from disk
             self._restore_files_from_session(folder_data)
+        # Ensure _folder_file_counts reflects raw disk counts for ALL folders
+        # (_restore_files_from_session only covers MAIN folders in folder_data
+        # and stores post-removal counts; TRANSITION folders are missing entirely)
+        self._scan_folder_file_counts()
+        # Refresh slider now that counts are correct (the earlier call inside
+        # _restore_files_from_session used stale post-removal counts)
+        self._update_trim_slider_for_selected_folder()
         self._update_flow_arrows()
 
         total_files = self.file_list.topLevelItemCount()
@@ -4068,6 +4091,23 @@ class SequenceLinkerUI(QWidget):
             of_poly_sigma=self.of_poly_sigma_spin.value()
         )
 
+    def _scan_folder_file_counts(self) -> None:
+        """Scan all source folders and set _folder_file_counts to raw disk counts.
+
+        This ensures the trim slider always shows the true total, regardless
+        of whether the file list was populated by _refresh_files (which does
+        this automatically) or _restore_files_from_session (which doesn't).
+        """
+        from config import SUPPORTED_EXTENSIONS
+        for i, folder in enumerate(self.source_folders):
+            fid = self._folder_ids[i]
+            if folder.is_dir():
+                count = sum(
+                    1 for f in folder.iterdir()
+                    if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+                )
+                self._folder_file_counts[fid] = count
+
     def _refresh_files(self, select_position: str = 'first') -> None:
         """Refresh the file list from all source folders, applying trim settings."""
         from config import SUPPORTED_EXTENSIONS
@@ -4493,7 +4533,7 @@ class SequenceLinkerUI(QWidget):
             self.trim_label.setText(f"Frames {included_start}-{included_end} of {total} ({included_count} included)")
 
     def _on_trim_changed(self, trim_start: int, trim_end: int, handle: str) -> None:
-        """Handle trim slider value changes."""
+        """Handle trim slider value changes (lightweight, called during drag)."""
         current_item = self._get_current_selected_item()
         if current_item is None:
             return
@@ -4508,6 +4548,17 @@ class SequenceLinkerUI(QWidget):
 
         self._folder_trim_settings[fid] = (trim_start, trim_end)
         self._update_trim_label(folder, total, trim_start, trim_end)
+
+    def _on_trim_drag_finished(self, trim_start: int, trim_end: int, handle: str) -> None:
+        """Handle trim drag release (expensive rebuild)."""
+        current_item = self._get_current_selected_item()
+        if current_item is None:
+            return
+        fid = self._get_fid_from_source_item(current_item)
+        if fid is None:
+            return
+
+        self._folder_trim_settings[fid] = (trim_start, trim_end)
         self._refresh_files(select_position='none')
         self._select_folder_boundary(fid, 'first' if handle == 'left' else 'last')
 
@@ -4603,6 +4654,11 @@ class SequenceLinkerUI(QWidget):
         self.image_slider.setValue(current_index)
 
         self._show_image_at_index(current_index)
+
+        # Sync source list selection so the trim slider shows this frame's folder
+        fid = current.data(0, Qt.ItemDataRole.UserRole + 2)
+        if fid is not None:
+            self._select_folder_in_lists(fid)
 
     def _show_image_at_index(self, index: int) -> None:
         """Display the image at the given index in the file list."""
@@ -5277,6 +5333,14 @@ class SequenceLinkerUI(QWidget):
                          if item.is_file() and item.suffix.lower() in _SUP_EXT],
                         key=str.lower
                     )
+                    # Apply trim settings to transition folders
+                    fid = self._folder_ids[idx]
+                    ts, te = self._folder_trim_settings.get(fid, (0, 0))
+                    if ts > 0 or te > 0:
+                        total_t = len(trans_files)
+                        ts = min(ts, max(0, total_t - 1))
+                        te = min(te, max(0, total_t - 1 - ts))
+                        trans_files = trans_files[ts:total_t - te]
                     if trans_files:
                         files_by_idx[idx] = trans_files
 
@@ -5415,7 +5479,7 @@ class SequenceLinkerUI(QWidget):
 
                         # Get trans frame position
                         trans_pos = t * (blend_trans.right_overlap - 1) if blend_trans.right_overlap > 1 else 0
-                        trans_idx = int(trans_pos)
+                        trans_idx = round(trans_pos)
                         trans_idx = min(trans_idx, blend_trans.right_overlap - 1)
                         trans_file = blend_trans.trans_files[trans_idx]
                         trans_path = blend_trans.trans_folder / trans_file

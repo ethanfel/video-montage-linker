@@ -15,6 +15,7 @@ class TrimSlider(QWidget):
     """
 
     trimChanged = pyqtSignal(int, int, str)  # Emits (trim_start, trim_end, 'left' or 'right')
+    trimDragFinished = pyqtSignal(int, int, str)  # Emits final values on mouse release
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         """Initialize the trim slider.
@@ -287,5 +288,11 @@ class TrimSlider(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         """Handle mouse release to stop dragging."""
-        self._dragging = None
-        self.setCursor(Qt.CursorShape.ArrowCursor)
+        if self._dragging:
+            handle = self._dragging
+            self._dragging = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.trimDragFinished.emit(self._trim_start, self._trim_end, handle)
+        else:
+            self._dragging = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)

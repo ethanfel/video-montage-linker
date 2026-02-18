@@ -1408,6 +1408,11 @@ class TransitionGenerator:
             folder_start_indices[i] = cumulative_idx
             cumulative_idx += len(files_by_idx.get(i, []))
 
+        # Track how many files are committed from each folder's start and end
+        # so overlaps never exceed available frames.
+        committed_from_start: dict[int, int] = {}  # folder idx → frames used from start
+        committed_from_end: dict[int, int] = {}    # folder idx → frames used from end
+
         # Look for transition boundaries (MAIN->TRANSITION and TRANSITION->MAIN)
         for i in range(len(folders) - 1):
             folder_a = folders[i]
@@ -1424,23 +1429,38 @@ class TransitionGenerator:
                 if not files_a or not files_b:
                     continue
 
-                # Get per-transition overlap settings if available
-                # Use i+1 as the key (the "incoming" folder position)
-                if per_transition_settings and (i + 1) in per_transition_settings:
-                    pts = per_transition_settings[i + 1]
-                    left_overlap = pts.left_overlap
-                    right_overlap = pts.right_overlap
+                # Get per-transition overlap settings from the TRANSITION folder
+                # (could be at position i or i+1 depending on boundary direction)
+                pts_key = i if type_a == FolderType.TRANSITION else i + 1
+                if per_transition_settings and pts_key in per_transition_settings:
+                    pts = per_transition_settings[pts_key]
+                    if type_a == FolderType.TRANSITION:
+                        # TRANS→MAIN boundary: use right_overlap (right boundary count)
+                        left_overlap = pts.right_overlap
+                        right_overlap = pts.right_overlap
+                    else:
+                        # MAIN→TRANS boundary: use left_overlap (left boundary count)
+                        left_overlap = pts.left_overlap
+                        right_overlap = pts.left_overlap
                 else:
                     # Use default of 16 for both
                     left_overlap = 16
                     right_overlap = 16
 
-                # Cap overlaps by available files
-                left_overlap = min(left_overlap, len(files_a))
-                right_overlap = min(right_overlap, len(files_b))
+                # Cap overlaps by available files, accounting for frames
+                # already committed to a prior boundary on the same folder.
+                # Keep both sides equal (symmetric) after capping.
+                avail_a = len(files_a) - committed_from_start.get(i, 0)
+                avail_b = len(files_b) - committed_from_end.get(i + 1, 0)
+                capped = min(left_overlap, right_overlap, avail_a, avail_b)
+                left_overlap = capped
+                right_overlap = capped
 
                 if left_overlap < 1 or right_overlap < 1:
                     continue
+
+                committed_from_end[i] = committed_from_end.get(i, 0) + left_overlap
+                committed_from_start[i + 1] = committed_from_start.get(i + 1, 0) + right_overlap
 
                 transitions.append(TransitionSpec(
                     main_folder=folder_a,

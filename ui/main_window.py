@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -3579,6 +3580,11 @@ class SequenceLinkerUI(QWidget):
         """Show context menu for folder type and overlap override."""
         item = self.source_list.itemAt(pos)
         if item is None:
+            if self.source_folders:
+                menu = QMenu(self)
+                cleanup_action = menu.addAction("Cleanup Unused Videos...")
+                cleanup_action.triggered.connect(self._show_cleanup_unused_dialog)
+                menu.exec(self.source_list.mapToGlobal(pos))
             return
 
         # Placeholder item → offer "Add Transition Folder..."
@@ -3675,6 +3681,324 @@ class SequenceLinkerUI(QWidget):
                     merge_action.triggered.connect(lambda: self._merge_adjacent_folders(fid, idx))
 
         menu.exec(self.source_list.mapToGlobal(pos))
+
+    @staticmethod
+    def _dir_size_bytes(path: Path) -> int:
+        """Recursively compute directory size in bytes."""
+        total = 0
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                    elif entry.is_dir(follow_symlinks=False):
+                        total += SequenceLinkerUI._dir_size_bytes(Path(entry.path))
+        except PermissionError:
+            pass
+        return total
+
+    @staticmethod
+    def _format_size(size_bytes: int) -> str:
+        """Format bytes as human-readable string."""
+        for unit in ('B', 'KB', 'MB', 'GB'):
+            if size_bytes < 1024 or unit == 'GB':
+                return f"{size_bytes:.1f} {unit}" if unit != 'B' else f"{size_bytes} B"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f} GB"
+
+    def _find_unused_video_dirs(self):
+        """Find video directories not referenced by current source folders.
+
+        Returns (unused_entries, scan_roots) where each entry is a dict with
+        video_dir, type_dir, name, type_name, size_bytes, has_latent,
+        latent_path, latent_size.
+        """
+        from config import SUPPORTED_EXTENSIONS
+
+        # Build scan roots: grandparent (type_of_video/ level) of each source folder
+        scan_roots: set[Path] = set()
+        used_video_dirs: set[Path] = set()
+
+        for folder in self.source_folders:
+            resolved = folder.resolve()
+            # parent = video_name/, grandparent = type_of_video/
+            video_dir = resolved.parent
+            type_dir = video_dir.parent
+
+            used_video_dirs.add(video_dir)
+
+            # Safety: skip if path is too short or type_dir doesn't exist
+            if len(type_dir.parts) < 2 or not type_dir.is_dir():
+                continue
+            scan_roots.add(type_dir)
+
+        unused_entries = []
+        for scan_root in sorted(scan_roots):
+            type_name = scan_root.name
+            try:
+                children = sorted(scan_root.iterdir())
+            except PermissionError:
+                continue
+
+            for child in children:
+                if not child.is_dir():
+                    continue
+                # Skip hidden dirs (.trash/, .git, etc.)
+                if child.name.startswith('.'):
+                    continue
+                # Skip if this video dir is used
+                if child in used_video_dirs:
+                    continue
+
+                # Verify it looks like a video dir: has vid/ subdir or
+                # any subdir containing images
+                has_vid_subdir = (child / 'vid').is_dir()
+                has_image_subdir = False
+                if not has_vid_subdir:
+                    try:
+                        for sub in child.iterdir():
+                            if sub.is_dir():
+                                # Check if subdir has image files
+                                try:
+                                    for f in sub.iterdir():
+                                        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS:
+                                            has_image_subdir = True
+                                            break
+                                except PermissionError:
+                                    pass
+                            if has_image_subdir:
+                                break
+                    except PermissionError:
+                        pass
+
+                if not has_vid_subdir and not has_image_subdir:
+                    continue
+
+                # Compute sizes
+                size_bytes = self._dir_size_bytes(child)
+
+                # Check for .latent sibling file
+                latent_path = scan_root / f"{child.name}.latent"
+                has_latent = latent_path.is_file()
+                latent_size = latent_path.stat().st_size if has_latent else 0
+
+                unused_entries.append({
+                    'video_dir': child,
+                    'type_dir': scan_root,
+                    'name': child.name,
+                    'type_name': type_name,
+                    'size_bytes': size_bytes,
+                    'has_latent': has_latent,
+                    'latent_path': latent_path,
+                    'latent_size': latent_size,
+                })
+
+        return unused_entries, scan_roots
+
+    def _show_cleanup_unused_dialog(self) -> None:
+        """Show dialog to find and cleanup unused video directories."""
+        from PyQt6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+            QTreeWidget, QTreeWidgetItem, QHeaderView, QPushButton,
+            QProgressDialog,
+        )
+
+        # --- Scan with progress dialog ---
+        progress = QProgressDialog("Scanning for unused video folders...", None, 0, 0, self)
+        progress.setWindowTitle("Scanning")
+        progress.setMinimumDuration(0)
+        progress.setModal(True)
+        progress.show()
+        QApplication.processEvents()
+
+        unused_entries, scan_roots = self._find_unused_video_dirs()
+
+        progress.close()
+
+        if not unused_entries:
+            QMessageBox.information(
+                self, "Cleanup Unused Videos",
+                "No unused video folders found."
+            )
+            return
+
+        # --- Build dialog ---
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Cleanup Unused Videos")
+        dlg.resize(750, 500)
+
+        layout = QVBoxLayout(dlg)
+
+        total_size = sum(e['size_bytes'] + e['latent_size'] for e in unused_entries)
+        summary_label = QLabel(
+            f"Found {len(unused_entries)} unused video folder(s) "
+            f"({self._format_size(total_size)} total) "
+            f"across {len(scan_roots)} type folder(s)."
+        )
+        layout.addWidget(summary_label)
+
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["Video Name", "Type", "Size", "Latent"])
+        tree.setRootIsDecorated(False)
+        tree.setAlternatingRowColors(True)
+        tree.header().setStretchLastSection(False)
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(tree)
+
+        for entry in unused_entries:
+            combined = entry['size_bytes'] + entry['latent_size']
+            latent_text = self._format_size(entry['latent_size']) if entry['has_latent'] else ""
+            item = QTreeWidgetItem([
+                entry['name'],
+                entry['type_name'],
+                self._format_size(combined),
+                latent_text,
+            ])
+            item.setCheckState(0, Qt.CheckState.Checked)
+            item.setData(0, Qt.ItemDataRole.UserRole, entry)
+            item.setToolTip(0, str(entry['video_dir']))
+            tree.addTopLevelItem(item)
+
+        # --- Check All / Uncheck All ---
+        check_layout = QHBoxLayout()
+        check_all_btn = QPushButton("Check All")
+        uncheck_all_btn = QPushButton("Uncheck All")
+
+        def set_all_checked(state):
+            for i in range(tree.topLevelItemCount()):
+                tree.topLevelItem(i).setCheckState(0, state)
+
+        check_all_btn.clicked.connect(lambda: set_all_checked(Qt.CheckState.Checked))
+        uncheck_all_btn.clicked.connect(lambda: set_all_checked(Qt.CheckState.Unchecked))
+        check_layout.addWidget(check_all_btn)
+        check_layout.addWidget(uncheck_all_btn)
+        check_layout.addStretch()
+        layout.addLayout(check_layout)
+
+        # --- Action buttons ---
+        btn_layout = QHBoxLayout()
+
+        delete_btn = QPushButton("Delete Selected")
+        delete_btn.setStyleSheet("color: red;")
+        trash_btn = QPushButton("Move to .trash/")
+        close_btn = QPushButton("Close")
+
+        def get_checked_entries():
+            entries = []
+            for i in range(tree.topLevelItemCount()):
+                ti = tree.topLevelItem(i)
+                if ti.checkState(0) == Qt.CheckState.Checked:
+                    entries.append((i, ti.data(0, Qt.ItemDataRole.UserRole)))
+            return entries
+
+        def remove_processed_items(indices):
+            for i in sorted(indices, reverse=True):
+                tree.takeTopLevelItem(i)
+            # Update summary
+            remaining = tree.topLevelItemCount()
+            if remaining == 0:
+                summary_label.setText("All selected folders processed.")
+            else:
+                rem_size = 0
+                for i in range(remaining):
+                    e = tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole)
+                    rem_size += e['size_bytes'] + e['latent_size']
+                summary_label.setText(
+                    f"{remaining} unused video folder(s) remaining "
+                    f"({self._format_size(rem_size)} total)."
+                )
+
+        def do_delete():
+            checked = get_checked_entries()
+            if not checked:
+                return
+            reply = QMessageBox.warning(
+                dlg, "Delete Permanently",
+                f"Permanently delete {len(checked)} video folder(s) "
+                f"and their .latent files?\n\nThis cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            success = 0
+            errors = []
+            processed_indices = []
+            for idx, entry in checked:
+                try:
+                    shutil.rmtree(entry['video_dir'])
+                    if entry['has_latent'] and entry['latent_path'].exists():
+                        entry['latent_path'].unlink()
+                    success += 1
+                    processed_indices.append(idx)
+                except Exception as e:
+                    errors.append(f"{entry['name']}: {e}")
+
+            remove_processed_items(processed_indices)
+
+            msg = f"Deleted {success} folder(s)."
+            if errors:
+                msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors)
+            QMessageBox.information(dlg, "Delete Complete", msg)
+
+        def do_trash():
+            checked = get_checked_entries()
+            if not checked:
+                return
+            reply = QMessageBox.question(
+                dlg, "Move to .trash/",
+                f"Move {len(checked)} video folder(s) to .trash/?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            success = 0
+            errors = []
+            processed_indices = []
+            for idx, entry in checked:
+                try:
+                    trash_dir = entry['type_dir'] / '.trash'
+                    trash_dir.mkdir(exist_ok=True)
+
+                    dest = trash_dir / entry['name']
+                    if dest.exists():
+                        shutil.rmtree(dest)
+                    shutil.move(str(entry['video_dir']), str(dest))
+
+                    if entry['has_latent'] and entry['latent_path'].exists():
+                        latent_dest = trash_dir / entry['latent_path'].name
+                        if latent_dest.exists():
+                            latent_dest.unlink()
+                        shutil.move(str(entry['latent_path']), str(latent_dest))
+
+                    success += 1
+                    processed_indices.append(idx)
+                except Exception as e:
+                    errors.append(f"{entry['name']}: {e}")
+
+            remove_processed_items(processed_indices)
+
+            msg = f"Moved {success} folder(s) to .trash/."
+            if errors:
+                msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors)
+            QMessageBox.information(dlg, "Trash Complete", msg)
+
+        delete_btn.clicked.connect(do_delete)
+        trash_btn.clicked.connect(do_trash)
+        close_btn.clicked.connect(dlg.close)
+
+        btn_layout.addWidget(delete_btn)
+        btn_layout.addWidget(trash_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        dlg.exec()
 
     def _show_file_list_context_menu(self, pos: QPoint) -> None:
         """Show context menu for file list items (split, remove)."""

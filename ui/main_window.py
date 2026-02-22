@@ -3409,15 +3409,19 @@ class SequenceLinkerUI(QWidget):
         layout = QVBoxLayout(dlg)
 
         tree = QTreeWidget()
-        tree.setHeaderLabels(["Date", "Destination", "Files"])
+        tree.setHeaderLabels(["", "Date", "Destination", "Files"])
         tree.setRootIsDecorated(False)
         tree.setAlternatingRowColors(True)
         tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         tree.header().setStretchLastSection(False)
         tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(tree)
+
+        lock_icon = "\U0001F512"  # locked padlock
+        unlock_icon = ""
 
         def populate_tree():
             tree.clear()
@@ -3428,28 +3432,59 @@ class SequenceLinkerUI(QWidget):
                 dest_short = s.destination
                 if len(dest_short) > 60:
                     dest_short = '...' + dest_short[-57:]
-                item = QTreeWidgetItem([date_str, dest_short, str(s.link_count)])
+                item = QTreeWidgetItem([
+                    lock_icon if s.locked else unlock_icon,
+                    date_str, dest_short, str(s.link_count),
+                ])
                 item.setData(0, Qt.ItemDataRole.UserRole, s)
-                item.setToolTip(1, s.destination)
+                item.setToolTip(2, s.destination)
+                if s.locked:
+                    item.setToolTip(0, "Locked — protected from deletion")
                 tree.addTopLevelItem(item)
             if tree.topLevelItemCount() > 0:
                 tree.setCurrentItem(tree.topLevelItem(0))
+
+        def toggle_lock():
+            selected_items = tree.selectedItems()
+            if not selected_items:
+                return
+            for item in selected_items:
+                s = item.data(0, Qt.ItemDataRole.UserRole)
+                if s is not None:
+                    try:
+                        new_state = self.db.toggle_session_locked(s.id)
+                        s.locked = new_state
+                        item.setData(0, Qt.ItemDataRole.UserRole, s)
+                        item.setText(0, lock_icon if new_state else unlock_icon)
+                        item.setToolTip(0, "Locked — protected from deletion" if new_state else "")
+                    except Exception as e:
+                        QMessageBox.critical(dlg, "Error", f"Failed to toggle lock:\n{e}")
 
         def delete_selected():
             selected_items = tree.selectedItems()
             if not selected_items:
                 return
-            count = len(selected_items)
+            # Filter out locked sessions
+            deletable = [it for it in selected_items
+                         if not getattr(it.data(0, Qt.ItemDataRole.UserRole), 'locked', False)]
+            locked_count = len(selected_items) - len(deletable)
+            if not deletable:
+                QMessageBox.information(dlg, "Delete Sessions",
+                                        "All selected sessions are locked.")
+                return
+            count = len(deletable)
             label = "session" if count == 1 else "sessions"
+            msg = f"Delete {count} {label}? This cannot be undone."
+            if locked_count:
+                msg += f"\n({locked_count} locked session(s) will be skipped.)"
             reply = QMessageBox.question(
-                dlg, "Delete Sessions",
-                f"Delete {count} {label}? This cannot be undone.",
+                dlg, "Delete Sessions", msg,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
             ids = []
-            for item in selected_items:
+            for item in deletable:
                 s = item.data(0, Qt.ItemDataRole.UserRole)
                 if s is not None:
                     ids.append(s.id)
@@ -3464,6 +3499,10 @@ class SequenceLinkerUI(QWidget):
         populate_tree()
 
         btn_layout = QHBoxLayout()
+        lock_btn = QPushButton("Toggle Lock")
+        lock_btn.setToolTip("Lock/unlock selected sessions to protect from deletion")
+        lock_btn.clicked.connect(toggle_lock)
+        btn_layout.addWidget(lock_btn)
         delete_btn = QPushButton("Delete Selected")
         delete_btn.clicked.connect(delete_selected)
         btn_layout.addWidget(delete_btn)
@@ -5844,42 +5883,72 @@ class SequenceLinkerUI(QWidget):
                     output_seq += 1
                 else:
                     if in_range:
-                        ext = source_path.suffix
+                        out_fmt = settings.output_format.lower()
+                        src_ext = source_path.suffix.lower()
+                        needs_convert = src_ext != f".{out_fmt}" and src_ext not in (
+                            '.jpg' if out_fmt == 'jpeg' else '', '.jpeg' if out_fmt == 'jpg' else ''
+                        )
+
+                        ext = f".{out_fmt}" if needs_convert else source_path.suffix
                         link_name = f"seq_{output_seq:05d}{ext}"
                         link_path = trans_dest / link_name
                         planned_names.add(link_name)
 
-                        # Check if existing file already matches — skip if unchanged
-                        already_correct = False
-                        if link_path.exists() or link_path.is_symlink():
-                            if copy_files:
-                                already_correct = SymlinkManager.copy_matches(link_path, source_path)
-                            else:
-                                already_correct = SymlinkManager.symlink_matches(link_path, source_path)
-
-                        if already_correct:
-                            skipped += 1
-                            symlink_records.append((
-                                str(source_path.resolve()),
-                                str(link_path), filename, output_seq
-                            ))
-                        else:
+                        if needs_convert:
+                            # Format mismatch — convert via PIL
                             try:
                                 if link_path.exists() or link_path.is_symlink():
                                     link_path.unlink()
 
-                                if copy_files:
-                                    shutil.copy2(source_path, link_path)
-                                else:
-                                    rel_source = Path(os.path.relpath(source_path.resolve(), trans_dest.resolve()))
-                                    link_path.symlink_to(rel_source)
+                                from PIL import Image
+                                img = Image.open(source_path)
+                                save_kwargs = {}
+                                if out_fmt in ('jpg', 'jpeg'):
+                                    img = img.convert('RGB')
+                                    save_kwargs['quality'] = settings.output_quality
+                                elif out_fmt == 'webp':
+                                    save_kwargs['quality'] = settings.output_quality
+                                    save_kwargs['method'] = settings.webp_method
+                                img.save(link_path, **save_kwargs)
                                 symlink_count += 1
                                 symlink_records.append((
                                     str(source_path.resolve()),
                                     str(link_path), filename, output_seq
                                 ))
                             except Exception as e:
-                                errors.append(f"Symlink {filename}: {e}")
+                                errors.append(f"Convert {filename}: {e}")
+                        else:
+                            # Check if existing file already matches — skip if unchanged
+                            already_correct = False
+                            if link_path.exists() or link_path.is_symlink():
+                                if copy_files:
+                                    already_correct = SymlinkManager.copy_matches(link_path, source_path)
+                                else:
+                                    already_correct = SymlinkManager.symlink_matches(link_path, source_path)
+
+                            if already_correct:
+                                skipped += 1
+                                symlink_records.append((
+                                    str(source_path.resolve()),
+                                    str(link_path), filename, output_seq
+                                ))
+                            else:
+                                try:
+                                    if link_path.exists() or link_path.is_symlink():
+                                        link_path.unlink()
+
+                                    if copy_files:
+                                        shutil.copy2(source_path, link_path)
+                                    else:
+                                        rel_source = Path(os.path.relpath(source_path.resolve(), trans_dest.resolve()))
+                                        link_path.symlink_to(rel_source)
+                                    symlink_count += 1
+                                    symlink_records.append((
+                                        str(source_path.resolve()),
+                                        str(link_path), filename, output_seq
+                                    ))
+                                except Exception as e:
+                                    errors.append(f"Symlink {filename}: {e}")
 
                     output_seq += 1
 

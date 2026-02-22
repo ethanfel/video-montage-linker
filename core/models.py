@@ -165,6 +165,7 @@ class SessionRecord:
     destination: str
     link_count: int = 0
     name: Optional[str] = None
+    locked: bool = False
 
 
 # --- Exceptions ---

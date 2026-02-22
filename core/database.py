@@ -219,6 +219,12 @@ class DatabaseManager:
                 'session_id, after_folder, frame_count, method, enabled, folder_order',
             )
 
+            # Migration: add locked column to symlink_sessions
+            try:
+                conn.execute("SELECT locked FROM symlink_sessions LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE symlink_sessions ADD COLUMN locked INTEGER DEFAULT 0")
+
             # Migration: remove overlap_frames from transition_settings (now per-transition)
             # We'll keep it for backward compatibility but won't use it
 
@@ -374,7 +380,8 @@ class DatabaseManager:
         """
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT s.id, s.created_at, s.destination, COUNT(l.id) as link_count, s.name
+                SELECT s.id, s.created_at, s.destination, COUNT(l.id) as link_count,
+                       s.name, COALESCE(s.locked, 0)
                 FROM symlink_sessions s
                 LEFT JOIN symlinks l ON s.id = l.session_id
                 GROUP BY s.id
@@ -387,7 +394,8 @@ class DatabaseManager:
                 created_at=datetime.fromisoformat(row[1]),
                 destination=row[2],
                 link_count=row[3],
-                name=row[4]
+                name=row[4],
+                locked=bool(row[5])
             )
             for row in rows
         ]
@@ -474,6 +482,8 @@ class DatabaseManager:
     def delete_sessions(self, session_ids: list[int]) -> None:
         """Delete multiple sessions in a single transaction.
 
+        Locked sessions are silently skipped.
+
         Args:
             session_ids: List of session IDs to delete.
 
@@ -486,11 +496,34 @@ class DatabaseManager:
             with self._connect() as conn:
                 placeholders = ','.join('?' for _ in session_ids)
                 conn.execute(
-                    f"DELETE FROM symlink_sessions WHERE id IN ({placeholders})",
+                    f"DELETE FROM symlink_sessions WHERE id IN ({placeholders}) AND COALESCE(locked, 0) = 0",
                     session_ids
                 )
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to delete sessions: {e}") from e
+
+    def toggle_session_locked(self, session_id: int) -> bool:
+        """Toggle the locked state of a session.
+
+        Returns:
+            The new locked state.
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT COALESCE(locked, 0) FROM symlink_sessions WHERE id = ?",
+                    (session_id,)
+                ).fetchone()
+                if row is None:
+                    raise DatabaseError(f"Session {session_id} not found")
+                new_val = 0 if row[0] else 1
+                conn.execute(
+                    "UPDATE symlink_sessions SET locked = ? WHERE id = ?",
+                    (new_val, session_id)
+                )
+                return bool(new_val)
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to toggle session lock: {e}") from e
 
     def get_sessions_by_destination(self, dest: str) -> list[SessionRecord]:
         """Get all sessions for a destination directory.
@@ -503,7 +536,8 @@ class DatabaseManager:
         """
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT s.id, s.created_at, s.destination, COUNT(l.id) as link_count, s.name
+                SELECT s.id, s.created_at, s.destination, COUNT(l.id) as link_count,
+                       s.name, COALESCE(s.locked, 0)
                 FROM symlink_sessions s
                 LEFT JOIN symlinks l ON s.id = l.session_id
                 WHERE s.destination = ?
@@ -517,7 +551,8 @@ class DatabaseManager:
                 created_at=datetime.fromisoformat(row[1]),
                 destination=row[2],
                 link_count=row[3],
-                name=row[4]
+                name=row[4],
+                locked=bool(row[5])
             )
             for row in rows
         ]
@@ -818,9 +853,8 @@ class DatabaseManager:
                     """INSERT INTO per_transition_settings
                        (session_id, trans_folder, left_overlap, right_overlap, folder_order)
                        VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(session_id, folder_order)
-                       DO UPDATE SET trans_folder=excluded.trans_folder,
-                                     left_overlap=excluded.left_overlap,
+                       ON CONFLICT(session_id, trans_folder, folder_order)
+                       DO UPDATE SET left_overlap=excluded.left_overlap,
                                      right_overlap=excluded.right_overlap""",
                     (session_id, str(settings.trans_folder),
                      settings.left_overlap, settings.right_overlap, folder_order)

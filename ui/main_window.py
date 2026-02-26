@@ -4880,18 +4880,33 @@ class SequenceLinkerUI(QWidget):
         self.trim_slider.setTrimStart(trim_start)
         self.trim_slider.setTrimEnd(trim_end)
 
-        self._update_trim_label(folder, total, trim_start, trim_end)
+        self._update_trim_label(fid, folder, total, trim_start, trim_end)
 
-    def _update_trim_label(self, folder: Path, total: int, trim_start: int, trim_end: int) -> None:
+    def _update_trim_label(self, fid: int, folder: Path, total: int, trim_start: int, trim_end: int) -> None:
         """Update the trim label to show current trim range."""
         included_start = trim_start + 1
         included_end = total - trim_end
-        included_count = included_end - trim_start
+        included_count = max(0, included_end - trim_start)
 
-        if trim_start == 0 and trim_end == 0:
-            self.trim_label.setText(f"Frames: All {total} included")
-        elif included_count <= 0:
+        # Count removed files that fall within the trimmed range
+        removed = self._removed_files.get(fid, set())
+        if removed and included_count > 0:
+            trimmed_files = self._get_trimmed_file_list(fid, folder)
+            removed_in_range = sum(1 for f in trimmed_files if f in removed)
+            effective_count = included_count - removed_in_range
+        else:
+            removed_in_range = 0
+            effective_count = included_count
+
+        if included_count <= 0:
             self.trim_label.setText(f"Frames: None included (all {total} trimmed)")
+        elif removed_in_range > 0:
+            self.trim_label.setText(
+                f"Frames {included_start}-{included_end} of {total} "
+                f"({effective_count} included, {removed_in_range} removed)"
+            )
+        elif trim_start == 0 and trim_end == 0:
+            self.trim_label.setText(f"Frames: All {total} included")
         else:
             self.trim_label.setText(f"Frames {included_start}-{included_end} of {total} ({included_count} included)")
 
@@ -4910,7 +4925,7 @@ class SequenceLinkerUI(QWidget):
         total = self._folder_file_counts.get(fid, 0)
 
         self._folder_trim_settings[fid] = (trim_start, trim_end)
-        self._update_trim_label(folder, total, trim_start, trim_end)
+        self._update_trim_label(fid, folder, total, trim_start, trim_end)
 
     def _on_trim_drag_finished(self, trim_start: int, trim_end: int, handle: str) -> None:
         """Handle trim drag release (expensive rebuild)."""

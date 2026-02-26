@@ -4429,6 +4429,7 @@ class SequenceLinkerUI(QWidget):
             self._folder_type_overrides[fid] = folder_type
 
         self._sync_dual_lists()
+        self._refresh_files()
         self._update_flow_arrows()
 
     def _update_folder_type_indicators(self, _=None) -> None:

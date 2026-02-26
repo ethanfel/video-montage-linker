@@ -2781,26 +2781,79 @@ class SequenceLinkerUI(QWidget):
             self.file_list.takeTopLevelItem(row)
 
     def _remove_selected_files(self) -> None:
-        """Remove selected files from the file list."""
+        """Remove selected files from the file list.
+
+        Files contiguous from the start/end of the trimmed range adjust the
+        trim handles so they can be restored by dragging the slider back.
+        Files removed from the middle are tracked as individual removals.
+        """
         selected = self.file_list.selectedItems()
         if not selected:
             return
 
-        # Track removed files for persistence
+        # Group selected filenames by fid
+        removed_by_fid: dict[int, set[str]] = {}
         for item in selected:
             data = item.data(0, Qt.ItemDataRole.UserRole)
             if data:
                 filename = data[1]
                 fid = item.data(0, Qt.ItemDataRole.UserRole + 2) or 0
+                removed_by_fid.setdefault(fid, set()).add(filename)
+
+        # For each fid, convert edge removals into trim adjustments
+        for fid, filenames in removed_by_fid.items():
+            idx = self._folder_ids.index(fid) if fid in self._folder_ids else -1
+            if idx < 0:
+                continue
+            folder = self.source_folders[idx]
+            trimmed = self._get_trimmed_file_list(fid, folder)
+            already_removed = self._removed_files.get(fid, set())
+            # Effective list: trimmed minus already-removed
+            effective = [f for f in trimmed if f not in already_removed]
+
+            if not effective:
+                continue
+
+            # Count contiguous removals from start
+            start_bump = 0
+            for f in effective:
+                if f in filenames:
+                    start_bump += 1
+                else:
+                    break
+
+            # Count contiguous removals from end
+            end_bump = 0
+            for f in reversed(effective):
+                if f in filenames:
+                    end_bump += 1
+                else:
+                    break
+
+            # Avoid double-counting if all files are removed
+            if start_bump + end_bump > len(effective):
+                start_bump = len(effective)
+                end_bump = 0
+
+            edge_files = set()
+            if start_bump > 0:
+                edge_files.update(effective[:start_bump])
+            if end_bump > 0:
+                edge_files.update(effective[-end_bump:])
+
+            # Adjust trim settings for edge removals
+            if start_bump > 0 or end_bump > 0:
+                trim_start, trim_end = self._folder_trim_settings.get(fid, (0, 0))
+                self._folder_trim_settings[fid] = (trim_start + start_bump, trim_end + end_bump)
+
+            # Remaining removals (middle) go to _removed_files
+            middle_files = filenames - edge_files
+            if middle_files:
                 if fid not in self._removed_files:
                     self._removed_files[fid] = set()
-                self._removed_files[fid].add(filename)
+                self._removed_files[fid].update(middle_files)
 
-        rows = sorted([self.file_list.indexOfTopLevelItem(item) for item in selected], reverse=True)
-        for row in rows:
-            self.file_list.takeTopLevelItem(row)
-
-        # Update the With Transitions tab to reflect the removal
+        self._refresh_files()
         self._update_sequence_table()
 
     def _get_path_history_file(self) -> Path:

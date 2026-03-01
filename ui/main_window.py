@@ -2472,14 +2472,19 @@ class SequenceLinkerUI(QWidget):
                 display_path = str(folder)
 
             # Show path with index and type
-            display_name = f"{i+1}. {type_tag} {display_path}{overlap_text}"
+            missing = not folder.is_dir()
+            missing_tag = " (MISSING)" if missing else ""
+            display_name = f"{i+1}. {type_tag} {display_path}{overlap_text}{missing_tag}"
             item = QListWidgetItem(display_name)
             item.setData(Qt.ItemDataRole.UserRole, (folder, fid))
             item.setToolTip(str(folder))  # Full path on hover
 
             # Color and alignment: Main = left/default, Transition = right/purple
-            if folder_type == FolderType.TRANSITION:
+            if missing:
+                item.setForeground(QColor(200, 80, 80))
+            elif folder_type == FolderType.TRANSITION:
                 item.setForeground(QColor(155, 89, 182))
+            if folder_type == FolderType.TRANSITION:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
             self.source_list.addItem(item)
@@ -3363,32 +3368,29 @@ class SequenceLinkerUI(QWidget):
             # Always create a new session so we never overwrite a manual save
             session_id = self.db.create_session(dest, name="autosave")
 
-            # Get current file list before clearing — don't clear if empty
-            # to avoid corrupting the session
-            files = self._get_files_in_order()
-            if not files and self.source_folders:
-                # file_list is empty but we have folders — don't overwrite
-                # the session, just save settings
-                return
-
             # Clear all stale data for this session before re-saving
             self.db.clear_session_data(session_id)
 
+            # Always save settings (folder order, trims, transitions) even if
+            # some folders are missing — this preserves the session layout so
+            # the user can replace missing folders after restore.
             self._save_session_settings(session_id, save_effective_types=True)
 
-            # Save the file list so the exact sequence can be restored
-            records = []
-            for i, (source_dir, filename, folder_idx, file_idx, _fid) in enumerate(files):
-                source_path = source_dir / filename
-                ext = source_path.suffix
-                link_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
-                records.append((
-                    str(source_path.resolve()),
-                    str(Path(dest) / link_name),
-                    filename,
-                    i,
-                ))
-            self.db.record_symlinks_batch(session_id, records)
+            # Save the file list for folders that still exist on disk
+            files = self._get_files_in_order()
+            if files:
+                records = []
+                for i, (source_dir, filename, folder_idx, file_idx, _fid) in enumerate(files):
+                    source_path = source_dir / filename
+                    ext = source_path.suffix
+                    link_name = f"seq{folder_idx + 1:02d}_{file_idx:04d}{ext}"
+                    records.append((
+                        str(source_path.resolve()),
+                        str(Path(dest) / link_name),
+                        filename,
+                        i,
+                    ))
+                self.db.record_symlinks_batch(session_id, records)
         except Exception:
             pass  # Best-effort save on close
 

@@ -55,7 +55,6 @@ def save_image(tensor: torch.Tensor, path: Path) -> None:
     Image.fromarray(arr).save(path)
 
 
-# Global model cache
 _model_cache: dict = {}
 
 
@@ -87,10 +86,10 @@ def get_model(repo_dir: Path, model_dir: Path, device: torch.device):
 
         print(f"Loading BiM-VFI model from {checkpoint_path}...", file=sys.stderr)
 
-        # Import BiM-VFI's component registry
-        from modules.components.components import make_components
+        # Import from the package __init__ so the @register decorator fires
+        from modules.components import make_components
 
-        # Create model with default config
+        # Create model with the trained config (pyr_level=3, feat_channels=32)
         cfg = {'name': 'bim_vfi', 'args': {'pyr_level': 3, 'feat_channels': 32}}
         model = make_components(cfg)
 
@@ -106,45 +105,14 @@ def get_model(repo_dir: Path, model_dir: Path, device: torch.device):
     return _model_cache[cache_key]
 
 
-def get_pyr_level(height: int) -> int:
-    """Get appropriate pyramid level based on image height.
-
-    Args:
-        height: Image height in pixels.
-
-    Returns:
-        Recommended pyramid level.
-    """
-    if height >= 2160:
-        return 7
-    elif height >= 1080:
-        return 6
-    else:
-        return 5
-
-
-def get_scale_factor(height: int) -> float:
-    """Get appropriate scale factor based on image height.
-
-    Args:
-        height: Image height in pixels.
-
-    Returns:
-        Recommended scale factor.
-    """
-    if height >= 2160:
-        return 0.25
-    elif height >= 1080:
-        return 0.5
-    else:
-        return 1.0
-
-
 @torch.no_grad()
 def interpolate_single(
     model, img0: torch.Tensor, img1: torch.Tensor, t: float
 ) -> torch.Tensor:
     """Perform single frame interpolation using BiM-VFI.
+
+    Uses the model's trained pyr_level (set at construction time).
+    The model handles input padding internally via InputPadder.
 
     Args:
         model: BiM-VFI model instance.
@@ -155,24 +123,11 @@ def interpolate_single(
     Returns:
         Interpolated frame tensor.
     """
-    h = img0.shape[2]
-    pyr_level = get_pyr_level(h)
-    scale_factor = get_scale_factor(h)
-
     time_step = torch.tensor([t]).view(1, 1, 1, 1).to(img0.device)
-
-    # Distance weights for better quality
-    dis0 = torch.ones((1, 1, h, img0.shape[3]), device=img0.device) * t
-    dis1 = 1 - dis0
 
     results_dict = model(
         img0=img0, img1=img1,
         time_step=time_step,
-        dis0=dis0, dis1=dis1,
-        scale_factor=scale_factor,
-        ratio=(1.0 / scale_factor),
-        pyr_level=pyr_level,
-        nr_lvl_skipped=0
     )
 
     return results_dict['imgt_pred'].clamp(0, 1)

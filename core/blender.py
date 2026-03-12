@@ -478,9 +478,13 @@ class FilmEnv:
 
 
 class BimVfiEnv:
-    """Manages BiM-VFI frame interpolation using shared venv with RIFE."""
+    """Manages BiM-VFI frame interpolation in its own isolated venv.
 
-    VENV_DIR = PRACTICAL_RIFE_VENV_DIR  # Share venv with RIFE
+    Uses a separate venv from RIFE/FILM to avoid dependency conflicts
+    (basicsr-fixed, cupy, etc. can break the RIFE/FILM torch install).
+    """
+
+    VENV_DIR = CACHE_DIR / 'venv-bimvfi'
     REPO_DIR = CACHE_DIR / 'BiM-VFI'
     MODEL_CACHE_DIR = CACHE_DIR / 'bim-vfi'
     CHECKPOINT_FILENAME = 'bim_vfi.pth'
@@ -488,10 +492,10 @@ class BimVfiEnv:
     # Google Drive file ID for the checkpoint
     GDRIVE_FILE_ID = '18Wre7XyRtu_wtFRzcsit6oNfHiFRt9vC'
 
-    # Extra pip packages needed beyond the base torch venv
+    # All pip packages needed (torch/torchvision installed separately)
     EXTRA_PACKAGES = [
         'basicsr-fixed', 'imageio', 'pyyaml', 'opencv-python',
-        'lpips', 'ptflops',
+        'lpips', 'ptflops', 'gdown',
     ]
 
     @classmethod
@@ -510,17 +514,62 @@ class BimVfiEnv:
 
     @classmethod
     def is_setup(cls) -> bool:
-        """Check if venv exists, repo is cloned, and checkpoint is present."""
+        """Check if venv exists with deps, repo is cloned, and checkpoint is present."""
         python = cls.get_venv_python()
         if not python or not python.exists():
             return False
         if not cls.REPO_DIR.exists():
             return False
-        return cls.get_checkpoint_path().exists()
+        if not cls.get_checkpoint_path().exists():
+            return False
+        # Verify torch is importable in this venv
+        result = subprocess.run(
+            [str(python), '-c', 'import torch; print(torch.__version__)'],
+            capture_output=True
+        )
+        return result.returncode == 0
+
+    @classmethod
+    def _create_venv(cls, progress_callback=None, cancelled_check=None) -> bool:
+        """Create the BiM-VFI venv and install PyTorch + deps.
+
+        Returns:
+            True if venv creation was successful.
+        """
+        if progress_callback:
+            progress_callback("Creating BiM-VFI Python environment...", 5)
+        if cancelled_check and cancelled_check():
+            return False
+
+        import venv
+        cls.VENV_DIR.mkdir(parents=True, exist_ok=True)
+        venv.create(str(cls.VENV_DIR), with_pip=True, clear=True)
+
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            print("[BiM-VFI] Failed to create venv", file=sys.stderr)
+            return False
+
+        # Install PyTorch (same approach as PracticalRifeEnv)
+        if progress_callback:
+            progress_callback("Installing PyTorch (this may take a while)...", 10)
+        if cancelled_check and cancelled_check():
+            return False
+
+        result = subprocess.run(
+            [str(python), '-m', 'pip', 'install', '--quiet',
+             'torch', 'torchvision', 'numpy'],
+            capture_output=True, text=True, timeout=600
+        )
+        if result.returncode != 0:
+            print(f"[BiM-VFI] PyTorch install failed: {result.stderr}", file=sys.stderr)
+            return False
+
+        return True
 
     @classmethod
     def setup_bim_vfi(cls, progress_callback=None, cancelled_check=None) -> bool:
-        """Clone repo, install deps, and download checkpoint.
+        """Create venv, clone repo, install deps, and download checkpoint.
 
         Args:
             progress_callback: Optional callback(message, percent) for progress.
@@ -529,15 +578,18 @@ class BimVfiEnv:
         Returns:
             True if setup was successful.
         """
-        python = cls.get_venv_python()
-        if not python or not python.exists():
-            return False
-
         try:
+            # Step 0: Create venv if needed
+            python = cls.get_venv_python()
+            if not python or not python.exists():
+                if not cls._create_venv(progress_callback, cancelled_check):
+                    return False
+                python = cls.get_venv_python()
+
             # Step 1: Clone repo if needed
             if not cls.REPO_DIR.exists():
                 if progress_callback:
-                    progress_callback("Cloning BiM-VFI repository...", 10)
+                    progress_callback("Cloning BiM-VFI repository...", 20)
                 if cancelled_check and cancelled_check():
                     return False
 
@@ -551,13 +603,12 @@ class BimVfiEnv:
 
             # Step 2: Install extra packages
             if progress_callback:
-                progress_callback("Installing BiM-VFI dependencies...", 30)
+                progress_callback("Installing BiM-VFI dependencies...", 35)
             if cancelled_check and cancelled_check():
                 return False
 
-            pip = cls.VENV_DIR / ('Scripts' if sys.platform == 'win32' else 'bin') / 'pip'
             result = subprocess.run(
-                [str(pip), 'install', '--quiet'] + cls.EXTRA_PACKAGES,
+                [str(python), '-m', 'pip', 'install', '--quiet'] + cls.EXTRA_PACKAGES,
                 capture_output=True, text=True, timeout=600
             )
             if result.returncode != 0:
@@ -574,7 +625,7 @@ class BimVfiEnv:
             cupy_installed = False
             for cupy_pkg in ['cupy-cuda12x', 'cupy-cuda11x']:
                 result = subprocess.run(
-                    [str(pip), 'install', '--quiet', cupy_pkg],
+                    [str(python), '-m', 'pip', 'install', '--quiet', cupy_pkg],
                     capture_output=True, text=True, timeout=600
                 )
                 if result.returncode == 0:
@@ -582,11 +633,8 @@ class BimVfiEnv:
                     break
 
             if not cupy_installed:
-                print("[BiM-VFI] Warning: cupy install failed, trying generic cupy", file=sys.stderr)
-                subprocess.run(
-                    [str(pip), 'install', '--quiet', 'cupy'],
-                    capture_output=True, text=True, timeout=600
-                )
+                print("[BiM-VFI] Warning: cupy install failed, model may not work on GPU",
+                      file=sys.stderr)
 
             # Step 3: Download checkpoint
             checkpoint_path = cls.get_checkpoint_path()
@@ -598,20 +646,14 @@ class BimVfiEnv:
 
                 cls.MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-                # Use gdown to download from Google Drive
-                result = subprocess.run(
-                    [str(pip), 'install', '--quiet', 'gdown'],
-                    capture_output=True, text=True, timeout=120
-                )
-
-                gdown_bin = cls.VENV_DIR / ('Scripts' if sys.platform == 'win32' else 'bin') / 'gdown'
+                # Use gdown via python -m to download from Google Drive
                 tmp_path = checkpoint_path.with_suffix('.tmp')
                 result = subprocess.run(
-                    [str(gdown_bin), '--id', cls.GDRIVE_FILE_ID,
+                    [str(python), '-m', 'gdown', '--id', cls.GDRIVE_FILE_ID,
                      '--output', str(tmp_path)],
                     capture_output=True, text=True, timeout=600
                 )
-                if result.returncode == 0 and tmp_path.exists():
+                if result.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 1_000_000:
                     tmp_path.rename(checkpoint_path)
                 else:
                     tmp_path.unlink(missing_ok=True)

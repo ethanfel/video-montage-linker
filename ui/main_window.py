@@ -311,7 +311,7 @@ class DirectTransitionDialog(QDialog):
 
         rife_ready = PracticalRifeEnv.is_setup()
         film_ready = FilmEnv.is_setup() if rife_ready else False
-        bim_ready = BimVfiEnv.is_setup() if rife_ready else False
+        bim_ready = BimVfiEnv.is_setup()
 
         if method == DirectInterpolationMethod.RIFE:
             if rife_ready:
@@ -338,29 +338,32 @@ class DirectTransitionDialog(QDialog):
                 self.status_label.setStyleSheet("color: orange; font-size: 10px;")
                 self.setup_btn.setVisible(True)
                 self.setup_btn.setText("Setup PyTorch Environment")
-        else:  # BIM_VFI
+        else:  # BIM_VFI (own venv, independent of RIFE)
             if bim_ready:
                 self.status_label.setText("BiM-VFI: Ready")
                 self.status_label.setStyleSheet("color: green; font-size: 10px;")
                 self.setup_btn.setVisible(False)
-            elif rife_ready:
-                self.status_label.setText("BiM-VFI: Not installed (repo + model needed)")
+            else:
+                self.status_label.setText("BiM-VFI: Not installed")
                 self.status_label.setStyleSheet("color: orange; font-size: 10px;")
                 self.setup_btn.setVisible(True)
                 self.setup_btn.setText("Install BiM-VFI")
-            else:
-                self.status_label.setText("BiM-VFI: Not installed (PyTorch required first)")
-                self.status_label.setStyleSheet("color: orange; font-size: 10px;")
-                self.setup_btn.setVisible(True)
-                self.setup_btn.setText("Setup PyTorch Environment")
 
     def _on_setup(self) -> None:
         """Handle setup button click."""
         method = self.method_combo.currentData()
+
+        # BiM-VFI has its own venv — handle independently
+        if method == DirectInterpolationMethod.BIM_VFI:
+            if not BimVfiEnv.is_setup():
+                self._setup_bim_vfi()
+            self._update_status()
+            return
+
+        # RIFE and FILM share a venv — set up base PyTorch if needed
         rife_ready = PracticalRifeEnv.is_setup()
 
         if not rife_ready:
-            # Need to set up PyTorch venv first
             progress = QProgressDialog(
                 "Setting up PyTorch environment...", "Cancel", 0, 100, self
             )
@@ -368,8 +371,6 @@ class DirectTransitionDialog(QDialog):
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.setMinimumDuration(0)
             progress.setValue(0)
-
-            cancelled = [False]
 
             def progress_cb(msg, pct):
                 progress.setLabelText(msg)
@@ -419,39 +420,37 @@ class DirectTransitionDialog(QDialog):
                     )
                 return
 
-        # If BiM-VFI selected and we need to install it
-        if method == DirectInterpolationMethod.BIM_VFI and not BimVfiEnv.is_setup():
-            progress = QProgressDialog(
-                "Setting up BiM-VFI...", "Cancel", 0, 100, self
-            )
-            progress.setWindowTitle("Setup")
-            progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.setValue(0)
-
-            def progress_cb(msg, pct):
-                progress.setLabelText(msg)
-                progress.setValue(pct)
-
-            def cancelled_check():
-                QApplication.processEvents()
-                return progress.wasCanceled()
-
-            success = BimVfiEnv.setup_bim_vfi(progress_cb, cancelled_check)
-            progress.close()
-
-            if not success:
-                if not cancelled_check():
-                    QMessageBox.warning(
-                        self, "Setup Failed",
-                        "Failed to set up BiM-VFI.\n\n"
-                        "If the checkpoint download failed, you can download it "
-                        "manually from Google Drive and place it at:\n"
-                        f"{BimVfiEnv.get_checkpoint_path()}"
-                    )
-                return
-
         self._update_status()
+
+    def _setup_bim_vfi(self) -> None:
+        """Run BiM-VFI setup with progress dialog."""
+        progress = QProgressDialog(
+            "Setting up BiM-VFI...", "Cancel", 0, 100, self
+        )
+        progress.setWindowTitle("Setup")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        def progress_cb(msg, pct):
+            progress.setLabelText(msg)
+            progress.setValue(pct)
+
+        def cancelled_check():
+            QApplication.processEvents()
+            return progress.wasCanceled()
+
+        success = BimVfiEnv.setup_bim_vfi(progress_cb, cancelled_check)
+        progress.close()
+
+        if not success and not cancelled_check():
+            QMessageBox.warning(
+                self, "Setup Failed",
+                "Failed to set up BiM-VFI.\n\n"
+                "If the checkpoint download failed, you can download it "
+                "manually from Google Drive and place it at:\n"
+                f"{BimVfiEnv.get_checkpoint_path()}"
+            )
 
     def _on_remove(self) -> None:
         """Handle remove button click."""

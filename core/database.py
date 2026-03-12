@@ -772,41 +772,6 @@ class DatabaseManager:
             )
         return None
 
-    def save_folder_type_override(
-        self,
-        session_id: int,
-        folder: str,
-        folder_type: FolderType,
-        trim_start: int = 0,
-        trim_end: int = 0
-    ) -> None:
-        """Save folder type override for a folder in a session.
-
-        Args:
-            session_id: The session ID.
-            folder: Path to the source folder.
-            folder_type: The folder type override.
-            trim_start: Number of images to trim from start.
-            trim_end: Number of images to trim from end.
-
-        Raises:
-            DatabaseError: If saving fails.
-        """
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    """INSERT INTO sequence_trim_settings
-                       (session_id, source_folder, trim_start, trim_end, folder_type)
-                       VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(session_id, source_folder)
-                       DO UPDATE SET trim_start=excluded.trim_start,
-                                     trim_end=excluded.trim_end,
-                                     folder_type=excluded.folder_type""",
-                    (session_id, folder, trim_start, trim_end, folder_type.value)
-                )
-        except sqlite3.Error as e:
-            raise DatabaseError(f"Failed to save folder type override: {e}") from e
-
     def get_folder_type_overrides(self, session_id: int) -> dict[str, FolderType]:
         """Get all folder type overrides for a session.
 
@@ -978,9 +943,8 @@ class DatabaseManager:
                     """INSERT INTO direct_transition_settings
                        (session_id, after_folder, frame_count, method, enabled, folder_order)
                        VALUES (?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(session_id, folder_order)
-                       DO UPDATE SET after_folder=excluded.after_folder,
-                                     frame_count=excluded.frame_count,
+                       ON CONFLICT(session_id, after_folder, folder_order)
+                       DO UPDATE SET frame_count=excluded.frame_count,
                                      method=excluded.method,
                                      enabled=excluded.enabled""",
                     (session_id, after_folder, frame_count, method, 1 if enabled else 0, folder_order)

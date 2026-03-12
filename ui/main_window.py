@@ -1597,7 +1597,9 @@ class SequenceLinkerUI(QWidget):
         fid_to_pos = {fid: i for i, fid in enumerate(self._folder_ids)}
         files_by_idx: dict[int, list[str]] = {}
         for source_dir, filename, folder_idx, file_idx, fid in files:
-            pi = fid_to_pos.get(fid, 0)
+            pi = fid_to_pos.get(fid)
+            if pi is None:
+                continue
             if pi not in files_by_idx:
                 files_by_idx[pi] = []
             files_by_idx[pi].append(filename)
@@ -2438,7 +2440,10 @@ class SequenceLinkerUI(QWidget):
         if len(self.source_folders) > 1:
             paths = [str(f) for f in self.source_folders]
             # Find common prefix
-            common_prefix = os.path.commonpath(paths) if paths else ""
+            try:
+                common_prefix = os.path.commonpath(paths) if paths else ""
+            except ValueError:
+                common_prefix = ""
             # Only use prefix if it's a meaningful directory (not just "/")
             if len(common_prefix) <= 1:
                 common_prefix = ""
@@ -2805,7 +2810,10 @@ class SequenceLinkerUI(QWidget):
                 fid = item.data(0, Qt.ItemDataRole.UserRole + 2) or 0
                 removed_by_fid.setdefault(fid, set()).add(filename)
 
-        # For each fid, convert edge removals into trim adjustments
+        # For each fid, convert edge removals into trim adjustments.
+        # Trim operates on the full (untrimmed) file list, so we must count
+        # how many trimmed-list positions to consume from each edge,
+        # including any already-removed files that fall within that span.
         for fid, filenames in removed_by_fid.items():
             idx = self._folder_ids.index(fid) if fid in self._folder_ids else -1
             if idx < 0:
@@ -2819,37 +2827,69 @@ class SequenceLinkerUI(QWidget):
             if not effective:
                 continue
 
-            # Count contiguous removals from start
-            start_bump = 0
+            # Count contiguous removals from start of effective list
+            start_count = 0
             for f in effective:
                 if f in filenames:
-                    start_bump += 1
+                    start_count += 1
                 else:
                     break
 
-            # Count contiguous removals from end
-            end_bump = 0
+            # Count contiguous removals from end of effective list
+            end_count = 0
             for f in reversed(effective):
                 if f in filenames:
-                    end_bump += 1
+                    end_count += 1
                 else:
                     break
 
             # Avoid double-counting if all files are removed
-            if start_bump + end_bump > len(effective):
-                start_bump = len(effective)
-                end_bump = 0
+            if start_count + end_count > len(effective):
+                start_count = len(effective)
+                end_count = 0
 
             edge_files = set()
-            if start_bump > 0:
-                edge_files.update(effective[:start_bump])
-            if end_bump > 0:
-                edge_files.update(effective[-end_bump:])
+            start_trim_bump = 0
+            end_trim_bump = 0
+
+            if start_count > 0:
+                edge_files.update(effective[:start_count])
+                # Walk the trimmed list from the start, counting positions
+                # until we've covered all start edge files (including
+                # already-removed files that fall within that span)
+                covered = 0
+                for f in trimmed:
+                    start_trim_bump += 1
+                    if f in edge_files:
+                        covered += 1
+                    if covered == start_count:
+                        break
+                # Also clear already-removed files that now fall within trim
+                for f in trimmed[:start_trim_bump]:
+                    if f in already_removed:
+                        already_removed.discard(f)
+
+            if end_count > 0:
+                edge_files.update(effective[-end_count:])
+                covered = 0
+                for f in reversed(trimmed):
+                    end_trim_bump += 1
+                    if f in edge_files:
+                        covered += 1
+                    if covered == end_count:
+                        break
+                for f in trimmed[len(trimmed) - end_trim_bump:]:
+                    if f in already_removed:
+                        already_removed.discard(f)
 
             # Adjust trim settings for edge removals
-            if start_bump > 0 or end_bump > 0:
+            if start_trim_bump > 0 or end_trim_bump > 0:
                 trim_start, trim_end = self._folder_trim_settings.get(fid, (0, 0))
-                self._folder_trim_settings[fid] = (trim_start + start_bump, trim_end + end_bump)
+                self._folder_trim_settings[fid] = (trim_start + start_trim_bump, trim_end + end_trim_bump)
+
+            # Clean up empty removed sets
+            if fid in self._removed_files and not self._removed_files[fid]:
+                del self._removed_files[fid]
 
             # Remaining removals (middle) go to _removed_files
             middle_files = filenames - edge_files
@@ -2947,7 +2987,9 @@ class SequenceLinkerUI(QWidget):
             self, "Select Destination Folder", start_dir
         )
         if path:
+            self.dst_path.blockSignals(True)
             self._add_to_path_history(self.dst_path, path)
+            self.dst_path.blockSignals(False)
             self.last_directory = str(Path(path).parent)
             self._try_resume_session(path)
 
@@ -3092,10 +3134,10 @@ class SequenceLinkerUI(QWidget):
             seen_resolved: set[str] = set()
             for position_idx, (folder_str, folder_type, trim_start, trim_end) in enumerate(ordered_folders):
                 folder_path = Path(folder_str)
-                # Resolve symlinks for consistent path matching
-                if not folder_path.exists():
-                    continue
-                folder_path = folder_path.resolve()
+                # Resolve symlinks for consistent path matching;
+                # keep missing folders so they appear as placeholders
+                if folder_path.exists():
+                    folder_path = folder_path.resolve()
                 resolved_str = str(folder_path)
                 fid = self._allocate_folder_id()
                 self.source_folders.append(folder_path)
@@ -3234,6 +3276,8 @@ class SequenceLinkerUI(QWidget):
 
             for i, folder_path in enumerate(self.source_folders):
                 fid = self._folder_ids[i]
+                if not folder_path.is_dir():
+                    continue
                 folder_str = str(folder_path)
                 if folder_str not in exported_by_folder:
                     continue
@@ -3585,8 +3629,13 @@ class SequenceLinkerUI(QWidget):
         if session is None:
             return
 
-        # Set destination path to match the session
+        # Set destination path to match the session — block signals to
+        # prevent _on_destination_changed from triggering a redundant
+        # _try_resume_session (which would load the *latest* session for
+        # this dest, not the one the user picked).
+        self.dst_path.blockSignals(True)
         self._add_to_path_history(self.dst_path, session.destination)
+        self.dst_path.blockSignals(False)
 
         self._restore_session_by_id(session)
 
@@ -4667,6 +4716,8 @@ class SequenceLinkerUI(QWidget):
                 if sf == folder_path:
                     fid = self._folder_ids[i]
                     break
+            if fid == 0:
+                continue  # Folder not in current source_folders, skip
 
             # Sort files by their sequence index
             sorted_files = sorted(file_list, key=lambda x: x[0])
@@ -5751,7 +5802,9 @@ class SequenceLinkerUI(QWidget):
         fid_to_pos = {fid: i for i, fid in enumerate(self._folder_ids)}
         files_by_idx: dict[int, list[str]] = {}
         for source_dir, filename, folder_idx, file_idx, fid in files:
-            pi = fid_to_pos.get(fid, 0)
+            pi = fid_to_pos.get(fid)
+            if pi is None:
+                continue
             if pi not in files_by_idx:
                 files_by_idx[pi] = []
             files_by_idx[pi].append(filename)
@@ -5956,11 +6009,13 @@ class SequenceLinkerUI(QWidget):
                     if in_range:
                         out_fmt = settings.output_format.lower()
                         src_ext = source_path.suffix.lower()
-                        needs_convert = src_ext != f".{out_fmt}" and src_ext not in (
-                            '.jpg' if out_fmt == 'jpeg' else '', '.jpeg' if out_fmt == 'jpg' else ''
+                        needs_convert = not (
+                            src_ext == f".{out_fmt}"
+                            or (out_fmt == 'jpeg' and src_ext == '.jpg')
+                            or (out_fmt == 'jpg' and src_ext == '.jpeg')
                         )
 
-                        ext = f".{out_fmt}" if needs_convert else source_path.suffix
+                        ext = f".{out_fmt}" if needs_convert else source_path.suffix.lower()
                         link_name = f"seq_{output_seq:05d}{ext}"
                         link_path = trans_dest / link_name
                         planned_names.add(link_name)

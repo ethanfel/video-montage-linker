@@ -72,10 +72,23 @@ def download_model(model_dir: Path) -> Path:
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / FILM_MODEL_FILENAME
 
+    if model_path.exists():
+        # Validate: a valid SavedModel has a saved_model.pb or is a valid file
+        # Quick check: file should be at least 1MB for a real model
+        if model_path.stat().st_size < 1_000_000:
+            print(f"Removing incomplete download at {model_path}", file=sys.stderr)
+            model_path.unlink()
+
     if not model_path.exists():
         print(f"Downloading FILM model to {model_path}...", file=sys.stderr)
-        urllib.request.urlretrieve(FILM_MODEL_URL, model_path)
-        print("Download complete.", file=sys.stderr)
+        tmp_path = model_path.with_suffix('.tmp')
+        try:
+            urllib.request.urlretrieve(FILM_MODEL_URL, tmp_path)
+            tmp_path.rename(model_path)
+            print("Download complete.", file=sys.stderr)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     return model_path
 

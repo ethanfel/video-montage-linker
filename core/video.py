@@ -94,20 +94,24 @@ def encode_image_sequence(
             text=True,
         )
 
-        cancelled = False
-        if proc.stdout:
-            for line in proc.stdout:
-                line = line.strip()
-                m = re.match(r'^frame=(\d+)', line)
-                if m and progress_callback is not None:
-                    current = int(m.group(1))
-                    if not progress_callback(current, total_frames):
-                        cancelled = True
-                        proc.terminate()
-                        proc.wait()
-                        break
+        try:
+            cancelled = False
+            if proc.stdout:
+                for line in proc.stdout:
+                    line = line.strip()
+                    m = re.match(r'^frame=(\d+)', line)
+                    if m and progress_callback is not None:
+                        current = int(m.group(1))
+                        if not progress_callback(current, total_frames):
+                            cancelled = True
+                            proc.terminate()
+                            break
 
-        proc.wait()
+            proc.wait()
+        except Exception:
+            proc.kill()
+            proc.wait()
+            raise
 
         if cancelled:
             # Clean up partial file
@@ -181,15 +185,17 @@ def encode_from_file_list(
             mode='w', suffix='.txt', delete=False, prefix='vml_concat_'
         )
         concat_path = Path(concat_file.name)
-        for p in file_paths:
-            # Escape single quotes for ffmpeg concat format
-            escaped = str(p.resolve()).replace("'", "'\\''")
+        try:
+            for p in file_paths:
+                # Escape single quotes for ffmpeg concat format
+                escaped = str(p.resolve()).replace("'", "'\\''")
+                concat_file.write(f"file '{escaped}'\n")
+                concat_file.write(f"duration {frame_duration}\n")
+            # Repeat last file so the last frame displays for its full duration
+            escaped = str(file_paths[-1].resolve()).replace("'", "'\\''")
             concat_file.write(f"file '{escaped}'\n")
-            concat_file.write(f"duration {frame_duration}\n")
-        # Repeat last file so the last frame displays for its full duration
-        escaped = str(file_paths[-1].resolve()).replace("'", "'\\''")
-        concat_file.write(f"file '{escaped}'\n")
-        concat_file.close()
+        finally:
+            concat_file.close()
     except OSError as e:
         return False, f"Failed to create concat file: {e}"
 
@@ -222,20 +228,24 @@ def encode_from_file_list(
             text=True,
         )
 
-        cancelled = False
-        if proc.stdout:
-            for line in proc.stdout:
-                line = line.strip()
-                m = re.match(r'^frame=(\d+)', line)
-                if m and progress_callback is not None:
-                    current = int(m.group(1))
-                    if not progress_callback(current, total_frames):
-                        cancelled = True
-                        proc.terminate()
-                        proc.wait()
-                        break
+        try:
+            cancelled = False
+            if proc.stdout:
+                for line in proc.stdout:
+                    line = line.strip()
+                    m = re.match(r'^frame=(\d+)', line)
+                    if m and progress_callback is not None:
+                        current = int(m.group(1))
+                        if not progress_callback(current, total_frames):
+                            cancelled = True
+                            proc.terminate()
+                            break
 
-        proc.wait()
+            proc.wait()
+        except Exception:
+            proc.kill()
+            proc.wait()
+            raise
 
         if cancelled:
             if output_path.exists():

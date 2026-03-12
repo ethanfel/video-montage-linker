@@ -3051,8 +3051,11 @@ class SequenceLinkerUI(QWidget):
         path = self.dst_path.currentText().strip()
         if path and Path(path).is_dir():
             resolved = str(Path(path).resolve())
-            # Add to history if it's a valid directory
+            # Block signals to prevent _add_to_path_history from
+            # re-emitting currentIndexChanged back into this method
+            self.dst_path.blockSignals(True)
             self._add_to_path_history(self.dst_path, path)
+            self.dst_path.blockSignals(False)
             if resolved != self._last_resumed_dest:
                 self._try_resume_session(path)
 
@@ -3448,9 +3451,9 @@ class SequenceLinkerUI(QWidget):
     def _auto_save_session(self) -> None:
         """Save current state to the database so it can be restored on next launch.
 
-        Creates or updates a session for the current destination path. This runs
-        on close so that folder setup, transition settings, trim, etc. survive
-        even if the user never explicitly exported.
+        Reuses the current session if it exists (clearing old data first),
+        otherwise creates a new one. Old autosave sessions for the same
+        destination are cleaned up to prevent unbounded accumulation.
         """
         try:
             if not self.source_folders:
@@ -3462,11 +3465,28 @@ class SequenceLinkerUI(QWidget):
 
             dest = str(Path(dst).resolve())
 
-            # Always create a new session so we never overwrite a manual save
-            session_id = self.db.create_session(dest, name="autosave")
+            if self._current_session_id is not None:
+                # Reuse existing session — clear stale data before re-saving
+                session_id = self._current_session_id
+                self.db.clear_session_data(session_id)
+            else:
+                session_id = self.db.create_session(dest, name="autosave")
+                self._current_session_id = session_id
 
-            # Clear all stale data for this session before re-saving
-            self.db.clear_session_data(session_id)
+            # Clean up old autosave sessions for this destination
+            # (keep the current one and any locked/named sessions)
+            try:
+                all_sessions = self.db.get_sessions_by_destination(dest)
+                old_autosaves = [
+                    s.id for s in all_sessions
+                    if s.id != session_id
+                    and s.name == "autosave"
+                    and not s.locked
+                ]
+                if old_autosaves:
+                    self.db.delete_sessions(old_autosaves)
+            except Exception:
+                pass  # Non-critical cleanup
 
             # Always save settings (folder order, trims, transitions) even if
             # some folders are missing — this preserves the session layout so
@@ -5280,19 +5300,30 @@ class SequenceLinkerUI(QWidget):
         self._apply_zoom()
 
     def _delete_current_image(self) -> None:
-        """Delete the currently displayed image from the sequence."""
+        """Delete the currently displayed image from the sequence.
+
+        Delegates to _remove_selected_files so that edge removals convert
+        to trim adjustments and middle removals are tracked in _removed_files.
+        Without this, removals would silently revert on any _refresh_files call.
+        """
         current_index = self.image_slider.value()
         total = self.file_list.topLevelItemCount()
 
         if total == 0 or current_index < 0 or current_index >= total:
             return
 
-        self.file_list.takeTopLevelItem(current_index)
-        self._recalculate_sequence_names()
+        item = self.file_list.topLevelItem(current_index)
+        if item is None:
+            return
 
+        # Select this item and delegate to the existing remove logic
+        # (_remove_selected_files calls _refresh_files which rebuilds the list)
+        self.file_list.clearSelection()
+        item.setSelected(True)
+        self._remove_selected_files()
+
+        # Update image viewer position after the list was rebuilt
         new_total = self.file_list.topLevelItemCount()
-        self.image_slider.setRange(0, max(0, new_total - 1))
-
         if new_total == 0:
             self.image_label.clear()
             self.image_name_label.setText("")

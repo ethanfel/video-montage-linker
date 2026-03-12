@@ -36,6 +36,7 @@ class DirectInterpolationMethod(Enum):
     """Method for direct frame interpolation between sequences."""
     RIFE = 'rife'
     FILM = 'film'
+    BIM_VFI = 'bim_vfi'
 
 
 # --- Data Classes ---

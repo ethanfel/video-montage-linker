@@ -477,6 +477,302 @@ class FilmEnv:
             return False, str(e), []
 
 
+class BimVfiEnv:
+    """Manages BiM-VFI frame interpolation using shared venv with RIFE."""
+
+    VENV_DIR = PRACTICAL_RIFE_VENV_DIR  # Share venv with RIFE
+    REPO_DIR = CACHE_DIR / 'BiM-VFI'
+    MODEL_CACHE_DIR = CACHE_DIR / 'bim-vfi'
+    CHECKPOINT_FILENAME = 'bim_vfi.pth'
+    REPO_URL = 'https://github.com/KAIST-VICLab/BiM-VFI.git'
+    # Google Drive file ID for the checkpoint
+    GDRIVE_FILE_ID = '18Wre7XyRtu_wtFRzcsit6oNfHiFRt9vC'
+
+    # Extra pip packages needed beyond the base torch venv
+    EXTRA_PACKAGES = [
+        'basicsr-fixed', 'imageio', 'pyyaml', 'opencv-python',
+        'lpips', 'ptflops',
+    ]
+
+    @classmethod
+    def get_venv_python(cls) -> Optional[Path]:
+        """Get path to venv Python executable."""
+        if cls.VENV_DIR.exists():
+            if sys.platform == 'win32':
+                return cls.VENV_DIR / 'Scripts' / 'python.exe'
+            return cls.VENV_DIR / 'bin' / 'python'
+        return None
+
+    @classmethod
+    def get_checkpoint_path(cls) -> Path:
+        """Get path to the BiM-VFI checkpoint."""
+        return cls.MODEL_CACHE_DIR / cls.CHECKPOINT_FILENAME
+
+    @classmethod
+    def is_setup(cls) -> bool:
+        """Check if venv exists, repo is cloned, and checkpoint is present."""
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            return False
+        if not cls.REPO_DIR.exists():
+            return False
+        return cls.get_checkpoint_path().exists()
+
+    @classmethod
+    def setup_bim_vfi(cls, progress_callback=None, cancelled_check=None) -> bool:
+        """Clone repo, install deps, and download checkpoint.
+
+        Args:
+            progress_callback: Optional callback(message, percent) for progress.
+            cancelled_check: Optional callable that returns True if cancelled.
+
+        Returns:
+            True if setup was successful.
+        """
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            return False
+
+        try:
+            # Step 1: Clone repo if needed
+            if not cls.REPO_DIR.exists():
+                if progress_callback:
+                    progress_callback("Cloning BiM-VFI repository...", 10)
+                if cancelled_check and cancelled_check():
+                    return False
+
+                result = subprocess.run(
+                    ['git', 'clone', '--depth', '1', cls.REPO_URL, str(cls.REPO_DIR)],
+                    capture_output=True, text=True, timeout=300
+                )
+                if result.returncode != 0:
+                    print(f"[BiM-VFI] git clone failed: {result.stderr}", file=sys.stderr)
+                    return False
+
+            # Step 2: Install extra packages
+            if progress_callback:
+                progress_callback("Installing BiM-VFI dependencies...", 30)
+            if cancelled_check and cancelled_check():
+                return False
+
+            pip = cls.VENV_DIR / ('Scripts' if sys.platform == 'win32' else 'bin') / 'pip'
+            result = subprocess.run(
+                [str(pip), 'install', '--quiet'] + cls.EXTRA_PACKAGES,
+                capture_output=True, text=True, timeout=600
+            )
+            if result.returncode != 0:
+                print(f"[BiM-VFI] pip install failed: {result.stderr}", file=sys.stderr)
+                return False
+
+            # Step 2b: Install cupy (needs CUDA-specific wheel)
+            if progress_callback:
+                progress_callback("Installing cupy (CUDA support)...", 50)
+            if cancelled_check and cancelled_check():
+                return False
+
+            # Try cupy-cuda12x first (CUDA 12), fall back to cupy-cuda11x
+            cupy_installed = False
+            for cupy_pkg in ['cupy-cuda12x', 'cupy-cuda11x']:
+                result = subprocess.run(
+                    [str(pip), 'install', '--quiet', cupy_pkg],
+                    capture_output=True, text=True, timeout=600
+                )
+                if result.returncode == 0:
+                    cupy_installed = True
+                    break
+
+            if not cupy_installed:
+                print("[BiM-VFI] Warning: cupy install failed, trying generic cupy", file=sys.stderr)
+                subprocess.run(
+                    [str(pip), 'install', '--quiet', 'cupy'],
+                    capture_output=True, text=True, timeout=600
+                )
+
+            # Step 3: Download checkpoint
+            checkpoint_path = cls.get_checkpoint_path()
+            if not checkpoint_path.exists():
+                if progress_callback:
+                    progress_callback("Downloading BiM-VFI checkpoint (~300MB)...", 60)
+                if cancelled_check and cancelled_check():
+                    return False
+
+                cls.MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+                # Use gdown to download from Google Drive
+                result = subprocess.run(
+                    [str(pip), 'install', '--quiet', 'gdown'],
+                    capture_output=True, text=True, timeout=120
+                )
+
+                gdown_bin = cls.VENV_DIR / ('Scripts' if sys.platform == 'win32' else 'bin') / 'gdown'
+                tmp_path = checkpoint_path.with_suffix('.tmp')
+                result = subprocess.run(
+                    [str(gdown_bin), '--id', cls.GDRIVE_FILE_ID,
+                     '--output', str(tmp_path)],
+                    capture_output=True, text=True, timeout=600
+                )
+                if result.returncode == 0 and tmp_path.exists():
+                    tmp_path.rename(checkpoint_path)
+                else:
+                    tmp_path.unlink(missing_ok=True)
+                    error = result.stderr.strip() if result.stderr else "unknown error"
+                    print(f"[BiM-VFI] Download failed: {error}", file=sys.stderr)
+                    print("[BiM-VFI] Please download manually from Google Drive and place at "
+                          f"{checkpoint_path}", file=sys.stderr)
+                    return False
+
+            if progress_callback:
+                progress_callback("BiM-VFI setup complete!", 100)
+
+            return cls.is_setup()
+
+        except Exception as e:
+            print(f"[BiM-VFI] Setup error: {e}", file=sys.stderr)
+            return False
+
+    @classmethod
+    def get_worker_script(cls) -> Path:
+        """Get path to the BiM-VFI worker script."""
+        return Path(__file__).parent / 'bim_vfi_worker.py'
+
+    @classmethod
+    def run_interpolation(
+        cls,
+        img_a_path: Path,
+        img_b_path: Path,
+        output_path: Path,
+        t: float
+    ) -> tuple[bool, str]:
+        """Run BiM-VFI interpolation via subprocess in venv.
+
+        Args:
+            img_a_path: Path to first input image.
+            img_b_path: Path to second input image.
+            output_path: Path to output image.
+            t: Timestep for interpolation (0.0 to 1.0).
+
+        Returns:
+            Tuple of (success, error_message).
+        """
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            return False, "venv python not found"
+
+        script = cls.get_worker_script()
+        if not script.exists():
+            return False, f"worker script not found: {script}"
+
+        cmd = [
+            str(python), str(script),
+            '--input0', str(img_a_path),
+            '--input1', str(img_b_path),
+            '--output', str(output_path),
+            '--timestep', str(t),
+            '--repo-dir', str(cls.REPO_DIR),
+            '--model-dir', str(cls.MODEL_CACHE_DIR)
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout per frame (BiM-VFI can be slow)
+            )
+            if result.returncode == 0 and output_path.exists():
+                return True, ""
+            else:
+                error = result.stderr.strip() if result.stderr else f"returncode={result.returncode}"
+                return False, error
+        except subprocess.TimeoutExpired:
+            return False, "timeout (300s)"
+        except Exception as e:
+            return False, str(e)
+
+    @classmethod
+    def run_batch_interpolation(
+        cls,
+        img_a_path: Path,
+        img_b_path: Path,
+        output_dir: Path,
+        frame_count: int,
+        output_pattern: str = 'frame_{:04d}.png'
+    ) -> tuple[bool, str, list[Path]]:
+        """Run BiM-VFI batch interpolation via subprocess in venv.
+
+        Args:
+            img_a_path: Path to first input image.
+            img_b_path: Path to second input image.
+            output_dir: Directory to save output frames.
+            frame_count: Number of frames to generate.
+            output_pattern: Filename pattern for output frames.
+
+        Returns:
+            Tuple of (success, error_message, list_of_output_paths).
+        """
+        python = cls.get_venv_python()
+        if not python or not python.exists():
+            return False, "venv python not found", []
+
+        script = cls.get_worker_script()
+        if not script.exists():
+            return False, f"worker script not found: {script}", []
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            str(python), str(script),
+            '--input0', str(img_a_path),
+            '--input1', str(img_b_path),
+            '--output-dir', str(output_dir),
+            '--frame-count', str(frame_count),
+            '--output-pattern', output_pattern,
+            '--repo-dir', str(cls.REPO_DIR),
+            '--model-dir', str(cls.MODEL_CACHE_DIR)
+        ]
+
+        try:
+            timeout = max(300, frame_count * 45)  # At least 5 min, +45s per frame
+
+            print(f"[BiM-VFI] Running batch interpolation: {frame_count} frames", file=sys.stderr)
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+
+            output_paths = [
+                output_dir / output_pattern.format(i)
+                for i in range(frame_count)
+            ]
+            existing_paths = [p for p in output_paths if p.exists()]
+
+            if result.returncode == 0 and len(existing_paths) == frame_count:
+                print(f"[BiM-VFI] Success: generated {len(existing_paths)} frames", file=sys.stderr)
+                return True, "", output_paths
+            else:
+                error_parts = []
+                if result.returncode != 0:
+                    error_parts.append(f"returncode={result.returncode}")
+                if result.stderr and result.stderr.strip():
+                    error_parts.append(f"stderr: {result.stderr.strip()}")
+                if len(existing_paths) != frame_count:
+                    error_parts.append(f"expected {frame_count} frames, got {len(existing_paths)}")
+
+                error = "; ".join(error_parts) if error_parts else "unknown error"
+                print(f"[BiM-VFI] Failed: {error}", file=sys.stderr)
+                return False, error, existing_paths
+
+        except subprocess.TimeoutExpired:
+            print(f"[BiM-VFI] Timeout after {timeout}s", file=sys.stderr)
+            return False, f"timeout ({timeout}s)", []
+        except Exception as e:
+            print(f"[BiM-VFI] Exception: {e}", file=sys.stderr)
+            return False, str(e), []
+
+
 class RifeDownloader:
     """Handles automatic download and caching of rife-ncnn-vulkan binary."""
 
@@ -1101,6 +1397,53 @@ class ImageBlender:
         return ImageBlender.practical_rife_blend(img_a, img_b, t)
 
     @staticmethod
+    def bim_vfi_blend(
+        img_a: Image.Image,
+        img_b: Image.Image,
+        t: float
+    ) -> Image.Image:
+        """Blend using BiM-VFI for high-quality interpolation.
+
+        BiM-VFI (Bidirectional Motion Field-Guided Frame Interpolation)
+        handles non-uniform motions well (CVPR 2025).
+
+        Args:
+            img_a: First PIL Image (source frame).
+            img_b: Second PIL Image (target frame).
+            t: Interpolation factor 0.0 (100% A) to 1.0 (100% B).
+
+        Returns:
+            AI-interpolated blended PIL Image.
+        """
+        if not BimVfiEnv.is_setup():
+            print("[BiM-VFI] Not set up, falling back to FILM", file=sys.stderr)
+            return ImageBlender.film_blend(img_a, img_b, t)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                input_a = tmp / 'a.png'
+                input_b = tmp / 'b.png'
+                output_file = tmp / 'out.png'
+
+                img_a.convert('RGB').save(input_a)
+                img_b.convert('RGB').save(input_b)
+
+                success, error_msg = BimVfiEnv.run_interpolation(
+                    input_a, input_b, output_file, t
+                )
+
+                if success and output_file.exists():
+                    return Image.open(output_file).copy()
+                else:
+                    print(f"[BiM-VFI] Interpolation failed: {error_msg}, falling back to FILM", file=sys.stderr)
+
+        except Exception as e:
+            print(f"[BiM-VFI] Exception: {e}, falling back to FILM", file=sys.stderr)
+
+        return ImageBlender.film_blend(img_a, img_b, t)
+
+    @staticmethod
     def blend_images(
         img_a_path: Path,
         img_b_path: Path,
@@ -1652,7 +1995,13 @@ class TransitionGenerator:
                 img_a_path, img_b_path, frame_count, dest, base_seq_num
             )
 
-        # For RIFE (or FILM fallback), generate frames one at a time
+        # For BiM-VFI, use batch mode
+        if method == DirectInterpolationMethod.BIM_VFI and BimVfiEnv.is_setup():
+            return self._generate_bim_vfi_frames_batch(
+                img_a_path, img_b_path, frame_count, dest, base_seq_num
+            )
+
+        # For RIFE (or fallback), generate frames one at a time
         # Load source images
         img_a = Image.open(img_a_path)
         img_b = Image.open(img_b_path)
@@ -1674,6 +2023,8 @@ class TransitionGenerator:
             # Generate interpolated frame
             if method == DirectInterpolationMethod.FILM:
                 blended = ImageBlender.film_blend(img_a, img_b, t)
+            elif method == DirectInterpolationMethod.BIM_VFI:
+                blended = ImageBlender.bim_vfi_blend(img_a, img_b, t)
             else:  # RIFE
                 blended = ImageBlender.practical_rife_blend(
                     img_a, img_b, t,
@@ -1814,6 +2165,113 @@ class TransitionGenerator:
                     frame.close()
 
                     # Remove temp file if different from output
+                    if temp_path != output_path:
+                        temp_path.unlink(missing_ok=True)
+
+                    results.append(BlendResult(
+                        output_path=output_path,
+                        source_a=img_a_path,
+                        source_b=img_b_path,
+                        blend_factor=t,
+                        success=True
+                    ))
+                else:
+                    results.append(BlendResult(
+                        output_path=output_path,
+                        source_a=img_a_path,
+                        source_b=img_b_path,
+                        blend_factor=t,
+                        success=False,
+                        error=f"Temp file not found: {temp_path}"
+                    ))
+            except Exception as e:
+                results.append(BlendResult(
+                    output_path=output_path,
+                    source_a=img_a_path,
+                    source_b=img_b_path,
+                    blend_factor=t,
+                    success=False,
+                    error=str(e)
+                ))
+
+        return results
+
+    def _generate_bim_vfi_frames_batch(
+        self,
+        img_a_path: Path,
+        img_b_path: Path,
+        frame_count: int,
+        dest: Path,
+        base_seq_num: int
+    ) -> list[BlendResult]:
+        """Generate BiM-VFI frames using batch mode.
+
+        Args:
+            img_a_path: Path to last frame of first sequence.
+            img_b_path: Path to first frame of second sequence.
+            frame_count: Number of interpolated frames to generate.
+            dest: Destination directory for generated frames.
+            base_seq_num: Starting sequence number for continuous naming.
+
+        Returns:
+            List of BlendResult objects.
+        """
+        results = []
+
+        temp_pattern = 'bimvfi_temp_{:04d}.png'
+
+        success, error, temp_paths = BimVfiEnv.run_batch_interpolation(
+            img_a_path,
+            img_b_path,
+            dest,
+            frame_count,
+            temp_pattern
+        )
+
+        if not success:
+            for i in range(frame_count):
+                t = (i + 1) / (frame_count + 1)
+                ext = f".{self.settings.output_format.lower()}"
+                seq_num = base_seq_num + i
+                output_name = f"seq_{seq_num:05d}{ext}"
+                output_path = dest / output_name
+
+                results.append(BlendResult(
+                    output_path=output_path,
+                    source_a=img_a_path,
+                    source_b=img_b_path,
+                    blend_factor=t,
+                    success=False,
+                    error=error
+                ))
+            return results
+
+        for i, temp_path in enumerate(temp_paths):
+            t = (i + 1) / (frame_count + 1)
+            ext = f".{self.settings.output_format.lower()}"
+            seq_num = base_seq_num + i
+            output_name = f"seq_{seq_num:05d}{ext}"
+            output_path = dest / output_name
+
+            try:
+                if temp_path.exists():
+                    frame = Image.open(temp_path)
+
+                    if self.settings.output_format.lower() in ('jpg', 'jpeg'):
+                        frame = frame.convert('RGB')
+
+                    save_kwargs = {}
+                    if self.settings.output_format.lower() in ('jpg', 'jpeg'):
+                        save_kwargs['quality'] = self.settings.output_quality
+                    elif self.settings.output_format.lower() == 'webp':
+                        save_kwargs['lossless'] = True
+                        save_kwargs['method'] = self.settings.webp_method
+                    elif self.settings.output_format.lower() == 'png':
+                        save_kwargs['compress_level'] = 6
+
+                    frame.save(output_path, **save_kwargs)
+                    frame.close()
+
                     if temp_path != output_path:
                         temp_path.unlink(missing_ok=True)
 

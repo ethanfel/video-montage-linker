@@ -67,6 +67,7 @@ from core import (
     find_ffmpeg,
     PracticalRifeEnv,
     FilmEnv,
+    BimVfiEnv,
     SymlinkManager,
     OPTICAL_FLOW_PRESETS,
 )
@@ -236,8 +237,12 @@ class DirectTransitionDialog(QDialog):
         self.method_combo = QComboBox()
         self.method_combo.addItem("RIFE (Fast, small motion)", DirectInterpolationMethod.RIFE)
         self.method_combo.addItem("FILM (Slow, large motion)", DirectInterpolationMethod.FILM)
-        if method == DirectInterpolationMethod.FILM:
-            self.method_combo.setCurrentIndex(1)
+        self.method_combo.addItem("BiM-VFI (Best quality, slowest)", DirectInterpolationMethod.BIM_VFI)
+        # Set current method
+        for i in range(self.method_combo.count()):
+            if self.method_combo.itemData(i) == method:
+                self.method_combo.setCurrentIndex(i)
+                break
         form_layout.addRow("Method:", self.method_combo)
 
         # Frame count
@@ -268,7 +273,8 @@ class DirectTransitionDialog(QDialog):
         # Explanation
         explain = QLabel(
             "RIFE: Fast AI interpolation, best for small motion and color shifts.\n"
-            "FILM: Google Research model, better for large motion and scene gaps.\n\n"
+            "FILM: Google Research model, better for large motion and scene gaps.\n"
+            "BiM-VFI: CVPR 2025, best quality for non-uniform/complex motions.\n\n"
             "Generated frames bridge the gap between the last frame of this\n"
             "sequence and the first frame of the next MAIN sequence."
         )
@@ -305,6 +311,7 @@ class DirectTransitionDialog(QDialog):
 
         rife_ready = PracticalRifeEnv.is_setup()
         film_ready = FilmEnv.is_setup() if rife_ready else False
+        bim_ready = BimVfiEnv.is_setup() if rife_ready else False
 
         if method == DirectInterpolationMethod.RIFE:
             if rife_ready:
@@ -316,18 +323,33 @@ class DirectTransitionDialog(QDialog):
                 self.status_label.setStyleSheet("color: orange; font-size: 10px;")
                 self.setup_btn.setVisible(True)
                 self.setup_btn.setText("Setup PyTorch Environment")
-        else:  # FILM
+        elif method == DirectInterpolationMethod.FILM:
             if film_ready:
                 self.status_label.setText("FILM: Ready")
                 self.status_label.setStyleSheet("color: green; font-size: 10px;")
                 self.setup_btn.setVisible(False)
             elif rife_ready:
-                self.status_label.setText("FILM: Package not installed")
+                self.status_label.setText("FILM: Model not downloaded")
                 self.status_label.setStyleSheet("color: orange; font-size: 10px;")
                 self.setup_btn.setVisible(True)
                 self.setup_btn.setText("Install FILM Package")
             else:
                 self.status_label.setText("FILM: Not installed (PyTorch required first)")
+                self.status_label.setStyleSheet("color: orange; font-size: 10px;")
+                self.setup_btn.setVisible(True)
+                self.setup_btn.setText("Setup PyTorch Environment")
+        else:  # BIM_VFI
+            if bim_ready:
+                self.status_label.setText("BiM-VFI: Ready")
+                self.status_label.setStyleSheet("color: green; font-size: 10px;")
+                self.setup_btn.setVisible(False)
+            elif rife_ready:
+                self.status_label.setText("BiM-VFI: Not installed (repo + model needed)")
+                self.status_label.setStyleSheet("color: orange; font-size: 10px;")
+                self.setup_btn.setVisible(True)
+                self.setup_btn.setText("Install BiM-VFI")
+            else:
+                self.status_label.setText("BiM-VFI: Not installed (PyTorch required first)")
                 self.status_label.setStyleSheet("color: orange; font-size: 10px;")
                 self.setup_btn.setVisible(True)
                 self.setup_btn.setText("Setup PyTorch Environment")
@@ -394,6 +416,38 @@ class DirectTransitionDialog(QDialog):
                     QMessageBox.warning(
                         self, "Setup Failed",
                         "Failed to install FILM package."
+                    )
+                return
+
+        # If BiM-VFI selected and we need to install it
+        if method == DirectInterpolationMethod.BIM_VFI and not BimVfiEnv.is_setup():
+            progress = QProgressDialog(
+                "Setting up BiM-VFI...", "Cancel", 0, 100, self
+            )
+            progress.setWindowTitle("Setup")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+
+            def progress_cb(msg, pct):
+                progress.setLabelText(msg)
+                progress.setValue(pct)
+
+            def cancelled_check():
+                QApplication.processEvents()
+                return progress.wasCanceled()
+
+            success = BimVfiEnv.setup_bim_vfi(progress_cb, cancelled_check)
+            progress.close()
+
+            if not success:
+                if not cancelled_check():
+                    QMessageBox.warning(
+                        self, "Setup Failed",
+                        "Failed to set up BiM-VFI.\n\n"
+                        "If the checkpoint download failed, you can download it "
+                        "manually from Google Drive and place it at:\n"
+                        f"{BimVfiEnv.get_checkpoint_path()}"
                     )
                 return
 

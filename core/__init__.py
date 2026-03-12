@@ -23,7 +23,7 @@ from .models import (
     DatabaseError,
 )
 from .database import DatabaseManager
-from .blender import ImageBlender, TransitionGenerator, RifeDownloader, PracticalRifeEnv, FilmEnv, OPTICAL_FLOW_PRESETS
+from .blender import ImageBlender, TransitionGenerator, RifeDownloader, PracticalRifeEnv, FilmEnv, BimVfiEnv, OPTICAL_FLOW_PRESETS
 from .manager import SymlinkManager
 from .video import encode_image_sequence, encode_from_file_list, find_ffmpeg
 
@@ -54,6 +54,7 @@ __all__ = [
     'RifeDownloader',
     'PracticalRifeEnv',
     'FilmEnv',
+    'BimVfiEnv',
     'SymlinkManager',
     'OPTICAL_FLOW_PRESETS',
     'encode_image_sequence',

@@ -1810,6 +1810,10 @@ class SequenceLinkerUI(QWidget):
                     fid = self._folder_ids[folder_idx]
                     # Add direct interpolation row after this folder's files
                     self._add_direct_interpolation_row(fid, folder, pair_idx_b)
+                    # Count direct interpolation frames in the output total
+                    direct_settings = self._direct_transitions.get(fid)
+                    if direct_settings and direct_settings.enabled:
+                        output_seq += direct_settings.frame_count
 
         self._sequence_frame_count = output_seq
         self.sequence_table.setUpdatesEnabled(True)
@@ -1851,7 +1855,7 @@ class SequenceLinkerUI(QWidget):
                 self.sequence_table.addTopLevelItem(placeholder_item)
         else:
             # Unconfigured: show grey "+" row
-            add_text = "  [+ Add RIFE/FILM transition] (click to configure)"
+            add_text = "  [+ Add AI transition] (click to configure)"
             add_item = QTreeWidgetItem([add_text, ""])
             add_item.setData(0, Qt.ItemDataRole.UserRole, ('direct_add', fid))
             add_item.setForeground(0, QColor(150, 150, 150))  # Grey
@@ -6074,7 +6078,10 @@ class SequenceLinkerUI(QWidget):
                             settings.output_quality, settings.webp_method,
                             settings.blend_method, settings.rife_binary_path,
                             settings.rife_model, settings.rife_uhd, settings.rife_tta,
-                            settings.practical_rife_model, settings.practical_rife_ensemble
+                            settings.practical_rife_model, settings.practical_rife_ensemble,
+                            settings.of_levels, settings.of_winsize,
+                            settings.of_iterations, settings.of_poly_n,
+                            settings.of_poly_sigma
                         )
 
                         if result.success:
@@ -6229,6 +6236,8 @@ class SequenceLinkerUI(QWidget):
                                             f"Direct interp {result.output_path.name}: {result.error}"
                                         )
                                     output_seq += 1
+                                    current_op += 1
+                                    progress.setValue(current_op)
                             else:
                                 output_seq += direct_settings.frame_count
 

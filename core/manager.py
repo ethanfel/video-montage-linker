@@ -85,7 +85,7 @@ class SymlinkManager:
         Handles all naming formats:
         - Old folder-indexed: seq01_0000.png
         - Continuous: seq_00000.png
-        Also removes blended image files and film_temp_*.png temporaries.
+        Also removes blended image files and film/bimvfi temp .png files.
 
         Args:
             directory: Directory to clean up.
@@ -101,7 +101,7 @@ class SymlinkManager:
             r'^seq\d*_\d+\.(png|jpg|jpeg|webp)$', re.IGNORECASE
         )
         temp_pattern = re.compile(
-            r'^film_temp_\d+\.png$', re.IGNORECASE
+            r'^(film|bimvfi)_temp_\d+\.png$', re.IGNORECASE
         )
         try:
             for item in directory.iterdir():
@@ -124,7 +124,7 @@ class SymlinkManager:
 
     @staticmethod
     def remove_orphan_files(directory: Path, keep_names: set[str]) -> int:
-        """Remove seq* files and film_temp_* not in the keep set.
+        """Remove seq* files and film/bimvfi temp files not in the keep set.
 
         Same pattern matching as cleanup_old_links but skips filenames
         present in keep_names.
@@ -144,7 +144,7 @@ class SymlinkManager:
             r'^seq\d*_\d+\.(png|jpg|jpeg|webp)$', re.IGNORECASE
         )
         temp_pattern = re.compile(
-            r'^film_temp_\d+\.png$', re.IGNORECASE
+            r'^(film|bimvfi)_temp_\d+\.png$', re.IGNORECASE
         )
         try:
             for item in directory.iterdir():

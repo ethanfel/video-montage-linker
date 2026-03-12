@@ -631,6 +631,23 @@ class SequenceLinkerUI(QWidget):
         self.range_reset_btn = QPushButton("Reset Range")
         self.range_reset_btn.setToolTip("Reset range to full sequence")
 
+        # Frame interpolation (doubling)
+        self.frame_interp_check = QCheckBox("Frame interpolation")
+        self.frame_interp_check.setToolTip("Interpolate between every consecutive frame to multiply frame count")
+
+        self.frame_interp_multiplier = QComboBox()
+        self.frame_interp_multiplier.addItem("2x", 2)
+        self.frame_interp_multiplier.addItem("4x", 4)
+        self.frame_interp_multiplier.addItem("8x", 8)
+        self.frame_interp_multiplier.setToolTip("Frame count multiplier (2x = 1 pass, 4x = 2 passes, 8x = 3 passes)")
+
+        self.frame_interp_method = QComboBox()
+        self.frame_interp_method.addItem("RIFE", DirectInterpolationMethod.RIFE)
+        self.frame_interp_method.addItem("FILM", DirectInterpolationMethod.FILM)
+        self.frame_interp_method.addItem("BiM-VFI", DirectInterpolationMethod.BIM_VFI)
+        self.frame_interp_method.setCurrentIndex(0)
+        self.frame_interp_method.setToolTip("Interpolation method")
+
         # Video encoding
         self.video_export_check = QCheckBox("Encode video")
         self.video_export_check.setToolTip("Encode output frames to video after export")
@@ -1099,6 +1116,13 @@ class SequenceLinkerUI(QWidget):
         range_layout.addWidget(self.range_reset_btn)
         range_layout.addStretch()
         export_opts_layout.addLayout(range_layout)
+
+        interp_layout = QHBoxLayout()
+        interp_layout.addWidget(self.frame_interp_check)
+        interp_layout.addWidget(self.frame_interp_multiplier)
+        interp_layout.addWidget(self.frame_interp_method)
+        interp_layout.addStretch()
+        export_opts_layout.addLayout(interp_layout)
 
         video_layout = QHBoxLayout()
         video_layout.addWidget(self.video_export_check)
@@ -5577,6 +5601,12 @@ class SequenceLinkerUI(QWidget):
             QMessageBox.critical(self, "Unexpected Error", str(e))
             return
 
+        # Frame interpolation pass (frame doubling)
+        if self.export_options_group.isChecked() and self.frame_interp_check.isChecked():
+            multiplier = self.frame_interp_multiplier.currentData()
+            method = self.frame_interp_method.currentData()
+            self._frame_interpolation_pass(trans_dst, multiplier, method)
+
         # Trigger video encoding if enabled — all output is in trans_dest
         if self.export_options_group.isChecked() and self.video_export_check.isChecked():
             self._encode_output_video(trans_dst)
@@ -5733,6 +5763,138 @@ class SequenceLinkerUI(QWidget):
                     self, "Encoding Failed",
                     f"Video encoding failed:\n{message}"
                 )
+
+    def _frame_interpolation_pass(
+        self,
+        output_dir: Path,
+        multiplier: int,
+        method: DirectInterpolationMethod
+    ) -> None:
+        """Multiply frame count by interpolating between consecutive frames.
+
+        Works in passes: each pass doubles the frame count. So 2x = 1 pass,
+        4x = 2 passes, 8x = 3 passes. Each pass renames existing files to
+        even positions and generates interpolated frames for odd positions.
+
+        Args:
+            output_dir: Directory containing the exported seq_*.ext files.
+            multiplier: Frame count multiplier (2, 4, or 8).
+            method: Interpolation method (RIFE, FILM, or BIM_VFI).
+        """
+        import math
+
+        num_passes = int(math.log2(multiplier))
+
+        # Determine which Env to use
+        if method == DirectInterpolationMethod.BIM_VFI:
+            env_cls = BimVfiEnv
+            env_name = "BiM-VFI"
+        elif method == DirectInterpolationMethod.FILM:
+            env_cls = FilmEnv
+            env_name = "FILM"
+        else:
+            env_cls = PracticalRifeEnv
+            env_name = "RIFE"
+
+        if not env_cls.is_setup():
+            QMessageBox.warning(
+                self, "Not Installed",
+                f"{env_name} is not set up. Please install it first via the "
+                "Direct Interpolation dialog."
+            )
+            return
+
+        for pass_num in range(num_passes):
+            # Collect existing seq_* files sorted by name
+            seq_files = sorted(
+                f for f in output_dir.iterdir()
+                if f.is_file() and f.name.startswith('seq_') and f.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp')
+            )
+
+            if len(seq_files) < 2:
+                return
+
+            total_pairs = len(seq_files) - 1
+            new_count = len(seq_files) * 2 - 1
+
+            progress = QProgressDialog(
+                f"Frame interpolation pass {pass_num + 1}/{num_passes} ({env_name} {multiplier}x)...",
+                "Cancel", 0, total_pairs, self
+            )
+            progress.setWindowTitle("Frame Interpolation")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            cancelled = False
+
+            # Use extension from first file for interpolated frames
+            ext = seq_files[0].suffix
+
+            # Step 1: Rename existing files to temp even-position names
+            # Use _fi_ prefix to avoid any collision with seq_ files
+            renamed = []
+            for i, f in enumerate(seq_files):
+                tmp_name = f"_fi_{i * 2:08d}{f.suffix}"
+                tmp_path = output_dir / tmp_name
+                f.rename(tmp_path)
+                renamed.append(tmp_path)
+
+            # Step 2: Generate odd-position interpolated frames
+            for i in range(total_pairs):
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+
+                frame_a = renamed[i]
+                frame_b = renamed[i + 1]
+                odd_name = f"_fi_{i * 2 + 1:08d}{ext}"
+                out_path = output_dir / odd_name
+
+                if method == DirectInterpolationMethod.BIM_VFI:
+                    success, error = BimVfiEnv.run_interpolation(
+                        frame_a, frame_b, out_path, 0.5
+                    )
+                elif method == DirectInterpolationMethod.FILM:
+                    success, error = FilmEnv.run_interpolation(
+                        frame_a, frame_b, out_path, 0.5
+                    )
+                else:  # RIFE
+                    success, error = PracticalRifeEnv.run_interpolation(
+                        frame_a, frame_b, out_path, 0.5,
+                        self._transition_settings.practical_rife_model,
+                        self._transition_settings.practical_rife_ensemble
+                    )
+
+                if not success:
+                    print(f"[Frame Interp] Failed {frame_a.name} <-> {frame_b.name}: {error}",
+                          file=sys.stderr)
+
+                progress.setValue(i + 1)
+                QApplication.processEvents()
+
+            progress.close()
+
+            if cancelled:
+                # Rename temp files back to seq_ format before stopping
+                temp_files = sorted(
+                    f for f in output_dir.iterdir()
+                    if f.is_file() and f.name.startswith('_fi_')
+                )
+                for i, f in enumerate(temp_files):
+                    f.rename(output_dir / f"seq_{i:05d}{f.suffix}")
+                QMessageBox.information(
+                    self, "Cancelled",
+                    f"Frame interpolation cancelled after pass {pass_num + 1}."
+                )
+                break
+
+            # Step 3: Rename all _fi_ files to seq_ format
+            all_fi = sorted(
+                f for f in output_dir.iterdir()
+                if f.is_file() and f.name.startswith('_fi_')
+            )
+            for i, f in enumerate(all_fi):
+                f.rename(output_dir / f"seq_{i:05d}{f.suffix}")
 
     def _encode_output_video(self, output_dir: Path) -> None:
         """Encode the exported image sequence to video using ffmpeg."""

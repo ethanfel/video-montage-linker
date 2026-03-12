@@ -101,7 +101,7 @@ class SymlinkManager:
             r'^seq\d*_\d+\.(png|jpg|jpeg|webp)$', re.IGNORECASE
         )
         temp_pattern = re.compile(
-            r'^(film|bimvfi)_temp_\d+\.png$', re.IGNORECASE
+            r'^((film|bimvfi)_temp_\d+\.png|_fi_\d+\.(png|jpg|jpeg|webp))$', re.IGNORECASE
         )
         try:
             for item in directory.iterdir():
@@ -144,7 +144,7 @@ class SymlinkManager:
             r'^seq\d*_\d+\.(png|jpg|jpeg|webp)$', re.IGNORECASE
         )
         temp_pattern = re.compile(
-            r'^(film|bimvfi)_temp_\d+\.png$', re.IGNORECASE
+            r'^((film|bimvfi)_temp_\d+\.png|_fi_\d+\.(png|jpg|jpeg|webp))$', re.IGNORECASE
         )
         try:
             for item in directory.iterdir():
